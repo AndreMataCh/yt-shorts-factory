@@ -58,22 +58,16 @@ async def get_active_groq_model(client: httpx.AsyncClient, headers: dict) -> str
             return m
     return available[0]
 
+import re
+
 async def generate_script(topic: str) -> dict:
-    if not GROQ_API_KEY:
-        raise RuntimeError("El secreto GROQ_API_KEY está vacío. Agrégalo en Settings -> Secrets -> Actions.")
-
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
     prompt = f"""Crea un YouTube Short viral de 35 segundos sobre: "{topic}".
-Devuelve ÚNICAMENTE un objeto JSON válido con esta estructura exacta:
+Responde UNICAMENTE con un objeto JSON válido (sin texto adicional ni bloques markdown), asegurándote de cerrar todas las comillas y llaves:
 {{
   "title": "Título magnético con gancho (máx 70 caracteres)",
   "description": "Descripción SEO atractiva con hashtags",
   "tags": ["curiosidades", "datos", "shorts"],
-  "script": "Guion narrado en español neutro sin acotaciones ni emojis, directo para leer en voz alta con ritmo rápido.",
+  "script": "Guion narrado en español neutro en un solo párrafo continuo sin saltos de línea ni emojis, directo para leer en voz alta.",
   "image_prompts": [
     "Detailed vertical 9:16 visual prompt in English for scene 1",
     "Detailed vertical 9:16 visual prompt in English for scene 2",
@@ -83,22 +77,39 @@ Devuelve ÚNICAMENTE un objeto JSON válido con esta estructura exacta:
   ]
 }}"""
 
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        model_id = await get_active_groq_model(client, headers)
-        print(f"Usando modelo LLM: {model_id}")
-
-        res = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers,
-            json={
-                "model": model_id,
-                "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"}
+    async with httpx.AsyncClient(timeout=45.0, headers=BROWSER_HEADERS) as client:
+        if GROQ_API_KEY:
+            print("Generando guion con Groq API...")
+            headers = {
+                **BROWSER_HEADERS,
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
             }
-        )
-        if res.status_code != 200:
-            raise RuntimeError(f"Groq Chat Error ({res.status_code}): {res.text}")
-        return json.loads(res.json()["choices"][0]["message"]["content"])
+            res = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [
+                        {"role": "system", "content": "You are a JSON generator. Always output valid, complete JSON only."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.5,
+                    "max_tokens": 1500
+                }
+            )
+            if res.status_code != 200:
+                raise RuntimeError(f"Error en Groq API ({res.status_code}): {res.text}")
+            
+            raw_text = res.json()["choices"][0]["message"]["content"]
+            match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+            if not match:
+                raise RuntimeError(f"No se encontró JSON en la respuesta: {raw_text}")
+            
+            clean_json = match.group(0)
+            return json.loads(clean_json, strict=False)
+
+        raise RuntimeError("No se encontró GROQ_API_KEY en Repository secrets.")
 
 async def transcribe_groq_whisper(audio_path: str) -> tuple[list, float]:
     async with httpx.AsyncClient(timeout=60.0) as client:
