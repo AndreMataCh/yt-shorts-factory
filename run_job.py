@@ -5,23 +5,34 @@ import asyncio
 import subprocess
 import urllib.parse
 import httpx
-import edge_tts
+import numpy as np
+import soundfile as sf
+from kokoro import KPipeline
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
+# === CONFIGURACIÓN Y VARIABLES DE ENTORNO ===
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
 PEXELS_API_KEY = (os.getenv("PEXELS_API_KEY") or "").strip()
 RAW_TOPIC = (os.getenv("TOPIC") or "Las 3 paradojas más extrañas del tiempo").strip()
 CHAT_ID = (os.getenv("CHAT_ID") or "1008445368").strip()
 
+# Parámetros opcionales enviados desde Cloudflare KV (Multi-paso)
+VOICE_STYLE = (os.getenv("VOICE_STYLE") or "1").strip()
+MODE_CHOICE = (os.getenv("MODE") or "3").strip()
+
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 }
 
 ACTIVE_GROQ_MODEL = None
+
+# Inicializar Pipeline de Kokoro-82M (código 'a' multilingüe/americano o 'e' español)
+# Descarga los pesos automáticamente en la primera ejecución
+kokoro_pipeline = KPipeline(lang_code='a')
 
 async def send_telegram(text: str):
     print(text)
@@ -86,64 +97,42 @@ async def ask_llm(prompt: str, max_tokens: int = 1800) -> str:
         content = res.json()["choices"][0]["message"]["content"]
         return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
-# === GENERADORES DE GUIONES (VIDEO LARGO + SHORT LANZADOR) ===
+# === GENERADORES DE GUIONES ===
 async def generate_long_plan(topic: str) -> dict:
     script_prompt = (
-        f"Escribe un guion documental fascinante y profundo en español neutro de unos 350 a 450 palabras (3 minutos) sobre: '{topic}'. "
-        "Estructura: Gancho inicial impactante, desarrollo con datos sorprendentes divididos en varios puntos y conclusión reflexiva. "
-        "REGLAS ESTRICTAS: Devuelve ÚNICAMENTE el texto que dirá el narrador. Sin títulos, sin asteriscos, sin emojis y sin acotaciones."
+        f"Escribe un guion documental fascinante y profundo en español neutro de unas 350 a 450 palabras sobre: '{topic}'. "
+        "Estructura: Gancho inicial impactante, desarrollo con datos sorprendentes y conclusión reflexiva. "
+        "REGLAS: Devuelve ÚNICAMENTE el texto que dirá el narrador. Sin títulos, sin asteriscos, sin emojis."
     )
     script = re.sub(r"[\*\#\[\]\(\)]", "", await ask_llm(script_prompt, max_tokens=2200)).strip()
+    title = (await ask_llm(f"Crea un título magnético de YouTube (máx 65 caracteres) en español para un documental sobre '{topic}'. SOLO el título sin comillas.")).replace('"', '').splitlines()[0].strip()[:75]
 
-    title = (await ask_llm(f"Crea un título magnético de YouTube (máximo 65 caracteres) en español para un documental sobre '{topic}'. Devuelve SOLO el título sin comillas.")).replace('"', '').splitlines()[0].strip()[:75]
-
-    terms_raw = await ask_llm(
-        f"Based on this documentary topic '{topic}', provide exactly 8 visual search terms in English separated by commas. "
-        "Return ONLY the 8 comma-separated terms, nothing else."
-    )
+    terms_raw = await ask_llm(f"Based on this documentary topic '{topic}', provide exactly 8 visual search terms in English separated by commas. Return ONLY the 8 comma-separated terms.")
     terms = [t.strip() for t in terms_raw.split(",") if t.strip()][:8]
     while len(terms) < 8:
         terms.append("cinematic mystery documentary background")
 
-    return {
-        "title": title,
-        "description": f"{title}\n\nEn este video exploramos a fondo: {topic}.\n\n{script[:250]}...\n\n#Documental #Misterios #Curiosidades",
-        "tags": ["documental", "curiosidades", "misterios", "historia", "ciencia"],
-        "script": script,
-        "search_terms": terms
-    }
+    return {"title": title, "description": f"{title}\n\nEn este video exploramos a fondo: {topic}.\n\n{script[:250]}...\n\n#Documental #Misterios", "tags": ["documental", "misterios", "ciencia"], "script": script, "search_terms": terms}
 
 async def generate_teaser_short_plan(topic: str, long_title: str, long_url: str) -> dict:
     script_prompt = (
-        f"Escribe un guion de YouTube Short de 30 segundos (unas 75 palabras) sobre '{topic}' que funcione como tráiler o gancho lanzador hacia nuestro video largo titulado '{long_title}'. "
-        "Empieza con un dato impactante, genera máxima intriga dejando el misterio principal sin resolver y termina diciendo exactamente: "
+        f"Escribe un guion de YouTube Short de 30 segundos (unas 75 palabras) sobre '{topic}' que funcione como gancho hacia nuestro video largo '{long_title}'. "
+        "Deja el misterio sin resolver y termina diciendo exactamente: "
         "'Acabo de subir el documental completo revelando toda la verdad, toca el enlace de abajo en la pantalla o en el primer comentario para verlo ahora mismo.' "
         "REGLAS: Devuelve ÚNICAMENTE el texto hablado en español neutro, sin asteriscos ni emojis."
     )
     script = re.sub(r"[\*\#\[\]\(\)]", "", await ask_llm(script_prompt, max_tokens=800)).strip()
+    title = (await ask_llm(f"Crea un título corto y misterioso (máx 55 caracteres) para un YouTube Short sobre '{topic}'. SOLO el título sin comillas.")).replace('"', '').splitlines()[0].strip()[:65]
 
-    title = (await ask_llm(f"Crea un título corto y misterioso (máximo 55 caracteres) para un YouTube Short sobre '{topic}'. SOLO el título sin comillas.")).replace('"', '').splitlines()[0].strip()[:65]
-
-    terms_raw = await ask_llm(
-        f"Provide 5 dramatic visual search terms in English separated by commas about '{topic}'. Return ONLY the 5 comma-separated items."
-    )
+    terms_raw = await ask_llm(f"Provide 5 dramatic visual search terms in English separated by commas about '{topic}'. Return ONLY the 5 comma-separated items.")
     terms = [t.strip() for t in terms_raw.split(",") if t.strip()][:5]
     while len(terms) < 5:
         terms.append("cinematic dark mystery")
 
-    desc = (
-        f"🔥 MIRA EL VIDEO COMPLETO AQUÍ 👉 {long_url}\n\n"
-        f"{title}\n\nVideo completo: {long_title} ({long_url})\n\n#Shorts #Curiosidades #Misterios"
-    )
-    return {
-        "title": title,
-        "description": desc,
-        "tags": ["shorts", "curiosidades", "misterios", "datos"],
-        "script": script,
-        "search_terms": terms
-    }
+    desc = f"🔥 MIRA EL VIDEO COMPLETO AQUÍ 👉 {long_url}\n\n{title}\n\nVideo completo: {long_title} ({long_url})\n\n#Shorts #Curiosidades"
+    return {"title": title, "description": desc, "tags": ["shorts", "curiosidades"], "script": script, "search_terms": terms}
 
-# === MOTOR AUDIO Y SUBTÍTULOS (.ASS ADAPTATIVO 16:9 Y 9:16) ===
+# === MOTOR KOKORO-82M PARA AUDIO Y SUBTÍTULOS ===
 def format_ass_time(seconds: float) -> str:
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
@@ -158,6 +147,31 @@ def get_audio_duration(audio_path: str) -> float:
     ]).decode().strip()
     return float(out)
 
+async def generate_voice_kokoro(script_text: str, audio_path: str):
+    """
+    Genera voz hiperrealista localmente utilizando Kokoro-82M.
+    """
+    # Seleccionar voz según la preferencia elegida en el bot (VOICE_STYLE)
+    voice_map = {
+        "1": "af_heart",   # Neutra / Principal
+        "2": "af_bella",   # Dinámica / Juvenil
+        "3": "af_nicole"   # Seria / Documental
+    }
+    voice_name = voice_map.get(VOICE_STYLE, "af_heart")
+    print(f"Generando voz con Kokoro-82M (Voz: {voice_name})...")
+
+    generator = kokoro_pipeline(script_text, voice=voice_name, speed=1.0)
+    audio_chunks = []
+    for _, _, chunk in generator:
+        audio_chunks.append(chunk)
+
+    if audio_chunks:
+        complete_audio = np.concatenate(audio_chunks)
+        sf.write(audio_path, complete_audio, 24000) # Kokoro emite a 24000 Hz
+    else:
+        raise RuntimeError("Kokoro-82M no pudo generar fragmentos de audio.")
+
+# === DESCARGA VISUAL Y ENSAMBLAJE FFMPEG ===
 def is_valid_image(file_path: str) -> bool:
     if not os.path.exists(file_path) or os.path.getsize(file_path) < 5000:
         return False
@@ -197,8 +211,8 @@ async def render_video(prefix: str, script_text: str, search_terms: list[str], i
     ass_path = f"output/{prefix}_subs.ass"
     final_video = f"output/{prefix}_final.mp4"
 
-    communicate = edge_tts.Communicate(script_text, voice="es-AR-TomasNeural", rate="+8%" if is_short else "+4%")
-    await communicate.save(audio_path)
+    # Generar voz con Kokoro-82M
+    await generate_voice_kokoro(script_text, audio_path)
     total_duration = get_audio_duration(audio_path)
 
     words = script_text.split()
@@ -226,7 +240,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             f.write(f"Dialogue: 1,0:00:00.00,{end_all},Banner,,0,0,0,,▼ VIDEO COMPLETO EN EL ENLACE DE ABAJO ▼\n")
 
         if is_short:
-            # 1 palabra por golpe para Shorts
             for idx, word in enumerate(words):
                 start = format_ass_time(idx * time_per_word)
                 end = format_ass_time((idx + 1) * time_per_word)
@@ -234,7 +247,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 if clean:
                     f.write(f"Dialogue: 0,{start},{end},Viral,,0,0,0,,{clean}\n")
         else:
-            # Frases de 4 palabras para el Video Largo horizontal
             chunk_size = 4
             for idx in range(0, len(words), chunk_size):
                 phrase = " ".join(words[idx:idx+chunk_size]).upper().replace("{", "").replace("}", "")
@@ -305,6 +317,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     return final_video
 
+# === SUBIDA A YOUTUBE ===
 def upload_youtube_rotated(video_path: str, title: str, description: str, tags: list[str], is_short: bool = True) -> str:
     token_files = sorted(glob.glob("tokens/token_*.json"))
     if not token_files:
@@ -315,16 +328,8 @@ def upload_youtube_rotated(video_path: str, title: str, description: str, tags: 
             creds = Credentials.from_authorized_user_file(token_path, ["https://www.googleapis.com/auth/youtube.upload"])
             youtube = build("youtube", "v3", credentials=creds)
             body = {
-                "snippet": {
-                    "title": title[:100],
-                    "description": description,
-                    "tags": tags,
-                    "categoryId": "27"
-                },
-                "status": {
-                    "privacyStatus": "public",
-                    "selfDeclaredMadeForKids": False
-                }
+                "snippet": {"title": title[:100], "description": description, "tags": tags, "categoryId": "27"},
+                "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False}
             }
             media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
             response = youtube.videos().insert(part="snippet,status", body=body, media_body=media).execute()
@@ -340,19 +345,19 @@ async def main():
     try:
         mode = "both"
         topic = RAW_TOPIC
-        if topic.lower().startswith("/short "):
+        if MODE_CHOICE == "1":
             mode = "short"
-            topic = topic[7:].strip()
-        elif topic.lower().startswith("/largo "):
+        elif MODE_CHOICE == "2":
             mode = "long"
-            topic = topic[7:].strip()
+        elif MODE_CHOICE == "3":
+            mode = "both"
 
         long_url = "https://youtube.com"
         long_title = topic
 
-        # 1. PRODUCIR Y SUBIR EL VIDEO LARGO HORIZONTAL (16:9)
+        # 1. VIDEO LARGO HORIZONTAL (16:9)
         if mode in ["both", "long"]:
-            await send_telegram(f"🎥 [1/2] Creando documental largo (16:9) sobre: '{topic}'...")
+            await send_telegram(f"🎥 [1/2] Creando documental largo con Kokoro-82M sobre: '{topic}'...")
             long_plan = await generate_long_plan(topic)
             long_title = long_plan["title"]
 
@@ -363,9 +368,9 @@ async def main():
             long_url = upload_youtube_rotated(long_video_path, long_title, long_plan["description"], long_plan["tags"], is_short=False)
             await send_telegram(f"✅ ¡Video Largo Publicado!\n📺 {long_title}\n🔗 {long_url}")
 
-        # 2. PRODUCIR Y SUBIR EL SHORT LANZADOR VERTICAL (9:16)
+        # 2. SHORT LANZADOR VERTICAL (9:16)
         if mode in ["both", "short"]:
-            await send_telegram(f"⚡ [2/2] Creando Short Lanzador (9:16) conectado al video largo...")
+            await send_telegram(f"⚡ [2/2] Creando Short Lanzador con Kokoro-82M...")
             short_plan = await generate_teaser_short_plan(topic, long_title, long_url)
 
             await send_telegram(f"🎬 Renderizando Short Lanzador: {short_plan['title']}...")
@@ -373,11 +378,11 @@ async def main():
 
             await send_telegram("🚀 Subiendo Short Lanzador a YouTube...")
             short_url = upload_youtube_rotated(short_video_path, short_plan["title"], short_plan["description"], short_plan["tags"], is_short=True)
-            await send_telegram(f"🔥 ¡Embudo Completo Publicado!\n\n📺 Video Largo: {long_url}\n📱 Short Lanzador: {short_url}")
+            await send_telegram(f"🔥 ¡Embudo Completo Publicado con Kokoro!\n\n📺 Video Largo: {long_url}\n📱 Short Lanzador: {short_url}")
 
     except Exception as e:
-        await send_telegram(f"❌ Error en la fábrica: {str(e)}")
+        await send_telegram(f"❌ Error en la fábrica (Kokoro): {str(e)}")
         raise e
 
 if __name__ == "__main__":
-    asyncio.run(main())     
+    asyncio.run(main())
