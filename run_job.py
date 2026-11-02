@@ -11,12 +11,11 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
-# === CONFIGURACIÓN Y VARIABLES DE ENTORNO ===
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
 PEXELS_API_KEY = (os.getenv("PEXELS_API_KEY") or "").strip()
-TOPIC = (os.getenv("TOPIC") or "Las 3 paradojas más extrañas del tiempo").strip()
-CHAT_ID = (os.getenv("CHAT_ID") or "").strip()
+RAW_TOPIC = (os.getenv("TOPIC") or "Las 3 paradojas más extrañas del tiempo").strip()
+CHAT_ID = (os.getenv("CHAT_ID") or "1008445368").strip()
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -35,47 +34,31 @@ async def send_telegram(text: str):
         except Exception as e:
             print(f"Aviso Telegram: {e}")
 
-# === AUTO-DETECTOR DE MODELOS ACTIVOS EN GROQ + RESPALDO GRATUITO ===
+# === MOTOR LLM CON AUTO-DETECCIÓN DE MODELOS ===
 async def get_working_groq_model(client: httpx.AsyncClient, headers: dict) -> str:
     global ACTIVE_GROQ_MODEL
     if ACTIVE_GROQ_MODEL:
         return ACTIVE_GROQ_MODEL
-
     res = await client.get("https://api.groq.com/openai/v1/models", headers=headers)
     if res.status_code != 200:
-        raise RuntimeError(f"Error consultando modelos en Groq ({res.status_code}): {res.text}")
-
+        raise RuntimeError(f"Error Groq Models ({res.status_code}): {res.text}")
     all_models = [m["id"] for m in res.json().get("data", [])]
-    # Filtrar modelos de audio, visión pura o moderación (guard)
     chat_models = [
         m for m in all_models
         if not any(x in m.lower() for x in ["whisper", "guard", "tts", "playai", "vision", "embed", "orpheus"])
     ]
-    print(f"Modelos de texto disponibles en tu cuenta Groq: {chat_models}")
-
-    # Priorizar modelos de mayor calidad (70b, llama-4, qwen, deepseek, 8b)
-    for keyword in ["70b", "llama-4", "qwen", "deepseek", "llama-3", "llama3", "gemma", "mixtral", "8b"]:
+    for keyword in ["70b", "llama-4", "qwen", "deepseek", "llama-3", "llama3", "gemma", "8b"]:
         for m in chat_models:
             if keyword in m.lower():
                 ACTIVE_GROQ_MODEL = m
-                print(f"--> Modelo seleccionado automáticamente: {ACTIVE_GROQ_MODEL}")
                 return ACTIVE_GROQ_MODEL
+    ACTIVE_GROQ_MODEL = chat_models[0]
+    return ACTIVE_GROQ_MODEL
 
-    if chat_models:
-        ACTIVE_GROQ_MODEL = chat_models[0]
-        return ACTIVE_GROQ_MODEL
-
-    raise RuntimeError("No se encontraron modelos de chat activos en esta cuenta de Groq.")
-
-async def ask_llm(prompt: str, system: str = "You are a helpful assistant.") -> str:
-    # Intento 1: Groq con detección dinámica del modelo activo
+async def ask_llm(prompt: str, max_tokens: int = 1800) -> str:
     if GROQ_API_KEY:
-        headers = {
-            **BROWSER_HEADERS,
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        async with httpx.AsyncClient(timeout=45.0) as client:
+        headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=60.0) as client:
             try:
                 model_name = await get_working_groq_model(client, headers)
                 res = await client.post(
@@ -83,75 +66,84 @@ async def ask_llm(prompt: str, system: str = "You are a helpful assistant.") -> 
                     headers=headers,
                     json={
                         "model": model_name,
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": prompt}
-                        ],
-                        "temperature": 0.6,
-                        "max_tokens": 1000
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.65,
+                        "max_tokens": max_tokens
                     }
                 )
                 if res.status_code == 200:
                     content = res.json()["choices"][0]["message"]["content"]
-                    # Limpiar bloques <think>...</think> por si selecciona un modelo razonador (DeepSeek/Qwen)
-                    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-                    return content
-                print(f"Aviso Groq ({res.status_code}): {res.text}. Usando motor de respaldo...")
+                    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
             except Exception as e:
-                print(f"Aviso en Groq: {e}. Saltando al motor gratuito de respaldo...")
+                print(f"Fallback LLM: {e}")
 
-    # Intento 2 (Respaldo infalible sin API Key): Pollinations OpenAI
     async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS) as client:
         res = await client.post(
             "https://text.pollinations.ai/openai",
-            json={
-                "model": "openai",
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt}
-                ]
-            }
+            json={"model": "openai", "messages": [{"role": "user", "content": prompt}]}
         )
         res.raise_for_status()
         content = res.json()["choices"][0]["message"]["content"]
         return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
-# === PASO 1: GENERADOR MODULAR ESTILO MONEYPRINTERTURBO ===
-async def generate_mpt_content(topic: str) -> dict:
+# === GENERADORES DE GUIONES (VIDEO LARGO + SHORT LANZADOR) ===
+async def generate_long_plan(topic: str) -> dict:
     script_prompt = (
-        f"Escribe un guion para un YouTube Short viral de 35 segundos sobre: '{topic}'. "
-        "REGLAS ESTRICTAS: Devuelve ÚNICAMENTE el texto que dirá el narrador en español neutro. "
-        "No incluyas títulos, ni etiquetas como 'Narrador:', ni emojis, ni asteriscos, ni acotaciones entre paréntesis. "
-        "Escribe todo en un solo párrafo fluido y atrapante."
+        f"Escribe un guion documental fascinante y profundo en español neutro de unos 350 a 450 palabras (3 minutos) sobre: '{topic}'. "
+        "Estructura: Gancho inicial impactante, desarrollo con datos sorprendentes divididos en varios puntos y conclusión reflexiva. "
+        "REGLAS ESTRICTAS: Devuelve ÚNICAMENTE el texto que dirá el narrador. Sin títulos, sin asteriscos, sin emojis y sin acotaciones."
     )
-    script = await ask_llm(script_prompt)
-    script = re.sub(r"[\*\#\[\]\(\)]", "", script).strip()
+    script = re.sub(r"[\*\#\[\]\(\)]", "", await ask_llm(script_prompt, max_tokens=2200)).strip()
 
-    title_prompt = (
-        f"Crea un título viral y curioso de máximo 60 caracteres para un video sobre '{topic}'. "
-        "Devuelve SOLO el título en español, sin comillas ni texto extra."
-    )
-    title = (await ask_llm(title_prompt)).replace('"', '').splitlines()[0].strip()[:70]
+    title = (await ask_llm(f"Crea un título magnético de YouTube (máximo 65 caracteres) en español para un documental sobre '{topic}'. Devuelve SOLO el título sin comillas.")).replace('"', '').splitlines()[0].strip()[:75]
 
-    terms_prompt = (
-        f"Based on this script: '{script}', provide exactly 5 visual scene descriptions in English "
-        "separated by a comma. Return ONLY the 5 comma-separated items, nothing else. "
-        "Example: galaxies spinning in space, antique pocket watch, futuristic city night, glowing brain neurons, dark ocean waves"
+    terms_raw = await ask_llm(
+        f"Based on this documentary topic '{topic}', provide exactly 8 visual search terms in English separated by commas. "
+        "Return ONLY the 8 comma-separated terms, nothing else."
     )
-    raw_terms = await ask_llm(terms_prompt)
-    search_terms = [t.strip() for t in raw_terms.split(",") if t.strip()][:5]
-    while len(search_terms) < 5:
-        search_terms.append("cinematic abstract universe background")
+    terms = [t.strip() for t in terms_raw.split(",") if t.strip()][:8]
+    while len(terms) < 8:
+        terms.append("cinematic mystery documentary background")
 
     return {
         "title": title,
-        "description": f"{title}\n\n{script[:150]}...\n\n#Shorts #Curiosidades #DatosCuriosos",
-        "tags": ["shorts", "curiosidades", "datos", "misterios", "ciencia"],
+        "description": f"{title}\n\nEn este video exploramos a fondo: {topic}.\n\n{script[:250]}...\n\n#Documental #Misterios #Curiosidades",
+        "tags": ["documental", "curiosidades", "misterios", "historia", "ciencia"],
         "script": script,
-        "search_terms": search_terms
+        "search_terms": terms
     }
 
-# === PASO 2: VOZ Y SUBTÍTULOS NATIVOS (EDGE-TTS) ===
+async def generate_teaser_short_plan(topic: str, long_title: str, long_url: str) -> dict:
+    script_prompt = (
+        f"Escribe un guion de YouTube Short de 30 segundos (unas 75 palabras) sobre '{topic}' que funcione como tráiler o gancho lanzador hacia nuestro video largo titulado '{long_title}'. "
+        "Empieza con un dato impactante, genera máxima intriga dejando el misterio principal sin resolver y termina diciendo exactamente: "
+        "'Acabo de subir el documental completo revelando toda la verdad, toca el enlace de abajo en la pantalla o en el primer comentario para verlo ahora mismo.' "
+        "REGLAS: Devuelve ÚNICAMENTE el texto hablado en español neutro, sin asteriscos ni emojis."
+    )
+    script = re.sub(r"[\*\#\[\]\(\)]", "", await ask_llm(script_prompt, max_tokens=800)).strip()
+
+    title = (await ask_llm(f"Crea un título corto y misterioso (máximo 55 caracteres) para un YouTube Short sobre '{topic}'. SOLO el título sin comillas.")).replace('"', '').splitlines()[0].strip()[:65]
+
+    terms_raw = await ask_llm(
+        f"Provide 5 dramatic visual search terms in English separated by commas about '{topic}'. Return ONLY the 5 comma-separated items."
+    )
+    terms = [t.strip() for t in terms_raw.split(",") if t.strip()][:5]
+    while len(terms) < 5:
+        terms.append("cinematic dark mystery")
+
+    desc = (
+        f"🔥 MIRA EL VIDEO COMPLETO AQUÍ 👉 {long_url}\n\n"
+        f"{title}\n\nVideo completo: {long_title} ({long_url})\n\n#Shorts #Curiosidades #Misterios"
+    )
+    return {
+        "title": title,
+        "description": desc,
+        "tags": ["shorts", "curiosidades", "misterios", "datos"],
+        "script": script,
+        "search_terms": terms
+    }
+
+# === MOTOR AUDIO Y SUBTÍTULOS (.ASS ADAPTATIVO 16:9 Y 9:16) ===
 def format_ass_time(seconds: float) -> str:
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
@@ -166,29 +158,24 @@ def get_audio_duration(audio_path: str) -> float:
     ]).decode().strip()
     return float(out)
 
-# === PASO 3: DESCARGA DE MATERIAL VISUAL (PEXELS VIDEO HD + FALLBACK IA) ===
-# === PASO 3: DESCARGA DE MATERIAL VISUAL VALIDADA (SIN LOOP INFINITO) ===
 def is_valid_image(file_path: str) -> bool:
-    """Verifica que el archivo descargado sea realmente un JPEG, PNG o WebP y no un error HTML."""
     if not os.path.exists(file_path) or os.path.getsize(file_path) < 5000:
         return False
     with open(file_path, "rb") as f:
         header = f.read(12)
-    # Firmas mágicas de JPEG (\xff\xd8), PNG (\x89PNG) y WEBP (RIFF...WEBP)
     return header.startswith(b"\xff\xd8") or header.startswith(b"\x89PNG") or (header.startswith(b"RIFF") and b"WEBP" in header)
 
-async def download_valid_image(client: httpx.AsyncClient, term: str, idx: int, img_file: str) -> bool:
+async def download_valid_image(client: httpx.AsyncClient, term: str, idx: int, img_file: str, w: int, h: int) -> bool:
     clean_term = re.sub(r"[^a-zA-Z0-9 ]", "", term).strip()
-    encoded = urllib.parse.quote(f"{clean_term}, vertical 9:16, cinematic, 8k")
-    keywords = ",".join(clean_term.split()[:3]) or "space,nature"
+    ratio_str = "vertical 9:16" if h > w else "widescreen 16:9"
+    encoded = urllib.parse.quote(f"{clean_term}, {ratio_str}, cinematic lighting, 8k")
+    keywords = ",".join(clean_term.split()[:3]) or "space,cinematic"
 
-    # Lista de proveedores gratuitos en cascada (IA -> Fotos HD temáticas -> Fotos HD aleatorias)
     urls = [
-        f"https://image.pollinations.ai/prompt/{encoded}?width=1080&height=1920&nologo=true&model=flux&seed={idx+200}",
-        f"https://loremflickr.com/1080/1920/{urllib.parse.quote(keywords)}?lock={idx+10}",
-        f"https://picsum.photos/seed/{idx+500}/1080/1920"
+        f"https://image.pollinations.ai/prompt/{encoded}?width={w}&height={h}&nologo=true&model=flux&seed={idx+300}",
+        f"https://loremflickr.com/{w}/{h}/{urllib.parse.quote(keywords)}?lock={idx+20}",
+        f"https://picsum.photos/seed/{idx+700}/{w}/{h}"
     ]
-
     for url in urls:
         try:
             resp = await client.get(url, timeout=25.0)
@@ -196,102 +183,114 @@ async def download_valid_image(client: httpx.AsyncClient, term: str, idx: int, i
                 with open(img_file, "wb") as f:
                     f.write(resp.content)
                 if is_valid_image(img_file):
-                    print(f"Imagen válida descargada para escena {idx} desde: {url.split('/')[2]}")
                     return True
-        except Exception as e:
-            print(f"Aviso descargando de {url.split('/')[2]}: {e}")
+        except Exception:
+            pass
     return False
 
-async def get_visual_clips(search_terms: list[str], total_duration: float) -> list[str]:
-    clip_paths = []
-    clip_duration = max(total_duration / len(search_terms), 2.5)
-
-    async with httpx.AsyncClient(timeout=45.0, follow_redirects=True, headers=BROWSER_HEADERS) as client:
-        for i, term in enumerate(search_terms):
-            clip_file = f"output/clip_{i}.mp4"
-            got_clip = False
-
-            # 1. Intentar video real de Pexels si hay API Key
-            if PEXELS_API_KEY:
-                try:
-                    pexels_url = f"https://api.pexels.com/videos/search?query={urllib.parse.quote(term)}&orientation=portrait&size=medium&per_page=3"
-                    r = await client.get(pexels_url, headers={"Authorization": PEXELS_API_KEY})
-                    videos = r.json().get("videos", [])
-                    if videos:
-                        video_files = videos[0].get("video_files", [])
-                        best_file = next((vf for vf in video_files if vf.get("width", 0) >= 720 and vf.get("height", 0) > vf.get("width", 0)), video_files[0])
-                        vid_data = await client.get(best_file["link"])
-                        raw_vid = f"output/raw_{i}.mp4"
-                        with open(raw_vid, "wb") as f:
-                            f.write(vid_data.content)
-                        subprocess.run([
-                            "ffmpeg", "-y", "-stream_loop", "-1", "-t", str(clip_duration), "-i", raw_vid,
-                            "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30",
-                            "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", clip_file
-                        ], check=True)
-                        got_clip = True
-                except Exception as e:
-                    print(f"Pexels fallback en escena {i}: {e}")
-
-            # 2. Descargar imagen validada y aplicar Zoom seguro (con límite de tiempo de entrada)
-            if not got_clip:
-                img_file = f"output/img_{i}.jpg"
-                has_img = await download_valid_image(client, term, i, img_file)
-                frames = int(clip_duration * 30)
-
-                if has_img:
-                    subprocess.run([
-                        "ffmpeg", "-y", "-loop", "1", "-t", str(clip_duration), "-i", img_file,
-                        "-vf", f"scale=1200:2134:force_original_aspect_ratio=increase,crop=1200:2134,zoompan=z='min(zoom+0.0015,1.25)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1080x1920:fps=30",
-                        "-t", str(clip_duration), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", clip_file
-                    ], check=True)
-                else:
-                    # Respaldo de emergencia generado por FFmpeg si todas las webs fallan
-                    subprocess.run([
-                        "ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=0x111827:s=1080x1920:d={clip_duration}:r=30",
-                        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", clip_file
-                    ], check=True)
-
-            clip_paths.append(str(os.path.abspath(clip_file)))
-    return clip_paths
-
-async def build_video(script_text: str, search_terms: list[str]) -> str:
+async def render_video(prefix: str, script_text: str, search_terms: list[str], is_short: bool = True, cta_banner: bool = False) -> str:
     os.makedirs("output", exist_ok=True)
-    audio_path = "output/voice.mp3"
-    ass_path = "output/subs.ass"
-    final_video = "output/final_short.mp4"
+    w, h = (1080, 1920) if is_short else (1920, 1080)
+    orientation = "portrait" if is_short else "landscape"
 
-    communicate = edge_tts.Communicate(script_text, voice="es-ES-AlvaroNeural", rate="+8%")
+    audio_path = f"output/{prefix}_voice.mp3"
+    ass_path = f"output/{prefix}_subs.ass"
+    final_video = f"output/{prefix}_final.mp4"
+
+    communicate = edge_tts.Communicate(script_text, voice="es-ES-AlvaroNeural", rate="+8%" if is_short else "+4%")
     await communicate.save(audio_path)
     total_duration = get_audio_duration(audio_path)
-    
+
     words = script_text.split()
     time_per_word = total_duration / max(len(words), 1)
+    font_size = 95 if is_short else 68
+    margin_v = 450 if is_short else 90
 
-    ass_header = """[Script Info]
+    ass_header = f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
+PlayResX: {w}
+PlayResY: {h}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Viral,Liberation Sans,95,&H0000FFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,6,3,5,40,40,450,1
+Style: Viral,Liberation Sans,{font_size},&H0000FFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,6,3,2,40,40,{margin_v},1
+Style: Banner,Liberation Sans,46,&H00FFFFFF,&H000000FF,&H000000FF,&H80000000,-1,0,0,0,100,100,0,0,3,14,0,2,40,40,220,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     with open(ass_path, "w", encoding="utf-8") as f:
         f.write(ass_header)
-        for idx, w in enumerate(words):
-            start = format_ass_time(idx * time_per_word)
-            end = format_ass_time((idx + 1) * time_per_word)
-            clean_word = w.strip().upper().replace("{", "").replace("}", "")
-            if clean_word:
-                f.write(f"Dialogue: 0,{start},{end},Viral,,0,0,0,,{clean_word}\n")
+        if cta_banner and is_short:
+            end_all = format_ass_time(total_duration)
+            f.write(f"Dialogue: 1,0:00:00.00,{end_all},Banner,,0,0,0,,▼ VIDEO COMPLETO EN EL ENLACE DE ABAJO ▼\n")
 
-    clip_paths = await get_visual_clips(search_terms, total_duration)
+        if is_short:
+            # 1 palabra por golpe para Shorts
+            for idx, word in enumerate(words):
+                start = format_ass_time(idx * time_per_word)
+                end = format_ass_time((idx + 1) * time_per_word)
+                clean = word.strip().upper().replace("{", "").replace("}", "")
+                if clean:
+                    f.write(f"Dialogue: 0,{start},{end},Viral,,0,0,0,,{clean}\n")
+        else:
+            # Frases de 4 palabras para el Video Largo horizontal
+            chunk_size = 4
+            for idx in range(0, len(words), chunk_size):
+                phrase = " ".join(words[idx:idx+chunk_size]).upper().replace("{", "").replace("}", "")
+                start = format_ass_time(idx * time_per_word)
+                end = format_ass_time(min((idx + chunk_size) * time_per_word, total_duration))
+                f.write(f"Dialogue: 0,{start},{end},Viral,,0,0,0,,{phrase}\n")
 
-    concat_file = "output/concat.txt"
+    clip_paths = []
+    clip_duration = max(total_duration / len(search_terms), 3.0)
+
+    async with httpx.AsyncClient(timeout=45.0, follow_redirects=True, headers=BROWSER_HEADERS) as client:
+        for i, term in enumerate(search_terms):
+            clip_file = f"output/{prefix}_clip_{i}.mp4"
+            got_clip = False
+
+            if PEXELS_API_KEY:
+                try:
+                    pexels_url = f"https://api.pexels.com/videos/search?query={urllib.parse.quote(term)}&orientation={orientation}&size=medium&per_page=3"
+                    r = await client.get(pexels_url, headers={"Authorization": PEXELS_API_KEY})
+                    videos = r.json().get("videos", [])
+                    if videos:
+                        vfiles = videos[0].get("video_files", [])
+                        best_file = vfiles[0]
+                        vid_data = await client.get(best_file["link"])
+                        raw_vid = f"output/{prefix}_raw_{i}.mp4"
+                        with open(raw_vid, "wb") as f:
+                            f.write(vid_data.content)
+                        subprocess.run([
+                            "ffmpeg", "-y", "-stream_loop", "-1", "-t", str(clip_duration), "-i", raw_vid,
+                            "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps=30",
+                            "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", clip_file
+                        ], check=True)
+                        got_clip = True
+                except Exception as e:
+                    print(f"Pexels fallback ({prefix} {i}): {e}")
+
+            if not got_clip:
+                img_file = f"output/{prefix}_img_{i}.jpg"
+                has_img = await download_valid_image(client, term, i, img_file, w, h)
+                frames = int(clip_duration * 30)
+                if has_img:
+                    scale_w, scale_h = int(w * 1.15), int(h * 1.15)
+                    subprocess.run([
+                        "ffmpeg", "-y", "-loop", "1", "-t", str(clip_duration), "-i", img_file,
+                        "-vf", f"scale={scale_w}:{scale_h}:force_original_aspect_ratio=increase,crop={scale_w}:{scale_h},zoompan=z='min(zoom+0.0012,1.20)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps=30",
+                        "-t", str(clip_duration), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", clip_file
+                    ], check=True)
+                else:
+                    subprocess.run([
+                        "ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=0x111827:s={w}x{h}:d={clip_duration}:r=30",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", clip_file
+                    ], check=True)
+
+            clip_paths.append(str(os.path.abspath(clip_file)))
+
+    concat_file = f"output/{prefix}_concat.txt"
     with open(concat_file, "w") as f:
         for cp in clip_paths:
             f.write(f"file '{cp}'\n")
@@ -306,11 +305,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     return final_video
 
-# === PASO 4: SUBIDA A YOUTUBE CON ROTADOR MULTI-PROYECTO ===
-def upload_youtube_rotated(video_path: str, title: str, description: str, tags: list[str]) -> str:
+def upload_youtube_rotated(video_path: str, title: str, description: str, tags: list[str], is_short: bool = True) -> str:
     token_files = sorted(glob.glob("tokens/token_*.json"))
     if not token_files:
-        raise RuntimeError("No se encontraron archivos token_*.json. Revisa el secreto YT_TOKEN_1.")
+        raise RuntimeError("No se encontraron archivos token_*.json.")
 
     for token_path in token_files:
         try:
@@ -330,31 +328,56 @@ def upload_youtube_rotated(video_path: str, title: str, description: str, tags: 
             }
             media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
             response = youtube.videos().insert(part="snippet,status", body=body, media_body=media).execute()
-            return f"https://youtube.com/shorts/{response['id']}"
+            vid_id = response["id"]
+            return f"https://youtube.com/shorts/{vid_id}" if is_short else f"https://youtu.be/{vid_id}"
         except HttpError as e:
             if e.resp.status in [403, 429] and ("quotaExceeded" in str(e) or "uploadLimitExceeded" in str(e)):
-                print(f"Cuota agotada en {token_path}, rotando al siguiente...")
                 continue
             raise e
     raise RuntimeError("Todos los tokens agotaron su cuota diaria.")
 
 async def main():
     try:
-        await send_telegram(f"🧠 [Motor MoneyPrinter] Creando guion para: '{TOPIC}'...")
-        plan = await generate_mpt_content(TOPIC)
-        print(f"Título generado: {plan['title']}")
-        print(f"Escenas: {plan['search_terms']}")
+        mode = "both"
+        topic = RAW_TOPIC
+        if topic.lower().startswith("/short "):
+            mode = "short"
+            topic = topic[7:].strip()
+        elif topic.lower().startswith("/largo "):
+            mode = "long"
+            topic = topic[7:].strip()
 
-        await send_telegram(f"🎬 Renderizando Short: {plan['title']}...")
-        video_path = await build_video(plan["script"], plan["search_terms"])
+        long_url = "https://youtube.com"
+        long_title = topic
 
-        await send_telegram("🚀 Subiendo a YouTube con rotador OAuth...")
-        yt_url = upload_youtube_rotated(video_path, plan["title"], plan["description"], plan["tags"])
+        # 1. PRODUCIR Y SUBIR EL VIDEO LARGO HORIZONTAL (16:9)
+        if mode in ["both", "long"]:
+            await send_telegram(f"🎥 [1/2] Creando documental largo (16:9) sobre: '{topic}'...")
+            long_plan = await generate_long_plan(topic)
+            long_title = long_plan["title"]
 
-        await send_telegram(f"✅ ¡Short publicado con éxito!\n📌 {plan['title']}\n🔗 {yt_url}")
+            await send_telegram(f"🎬 Renderizando Video Largo HD: {long_title}...")
+            long_video_path = await render_video("long", long_plan["script"], long_plan["search_terms"], is_short=False)
+
+            await send_telegram("🚀 Subiendo Video Largo a YouTube...")
+            long_url = upload_youtube_rotated(long_video_path, long_title, long_plan["description"], long_plan["tags"], is_short=False)
+            await send_telegram(f"✅ ¡Video Largo Publicado!\n📺 {long_title}\n🔗 {long_url}")
+
+        # 2. PRODUCIR Y SUBIR EL SHORT LANZADOR VERTICAL (9:16)
+        if mode in ["both", "short"]:
+            await send_telegram(f"⚡ [2/2] Creando Short Lanzador (9:16) conectado al video largo...")
+            short_plan = await generate_teaser_short_plan(topic, long_title, long_url)
+
+            await send_telegram(f"🎬 Renderizando Short Lanzador: {short_plan['title']}...")
+            short_video_path = await render_video("short", short_plan["script"], short_plan["search_terms"], is_short=True, cta_banner=(mode == "both"))
+
+            await send_telegram("🚀 Subiendo Short Lanzador a YouTube...")
+            short_url = upload_youtube_rotated(short_video_path, short_plan["title"], short_plan["description"], short_plan["tags"], is_short=True)
+            await send_telegram(f"🔥 ¡Embudo Completo Publicado!\n\n📺 Video Largo: {long_url}\n📱 Short Lanzador: {short_url}")
+
     except Exception as e:
         await send_telegram(f"❌ Error en la fábrica: {str(e)}")
         raise e
 
 if __name__ == "__main__":
-    asyncio.run(main())                                        
+    asyncio.run(main())     
