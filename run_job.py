@@ -23,7 +23,7 @@ RAW_TOPIC = (os.getenv("TOPIC") or "Las 3 paradojas más extrañas del tiempo").
 VOICE_STYLE = (os.getenv("VOICE_STYLE") or "1").strip()
 RAW_COUNT = (os.getenv("VIDEO_COUNT") or "1").strip()
 MODE_CHOICE = (os.getenv("MODE") or "3").strip()
-CHAT_ID = (os.getenv("CHAT_ID") or "1008445368").strip()
+CHAT_ID = (os.getenv("CHAT_ID") or "").strip()
 
 try:
     VIDEO_COUNT = max(1, min(int(re.sub(r"[^0-9]", "", RAW_COUNT) or "1"), 10))
