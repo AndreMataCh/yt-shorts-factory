@@ -167,15 +167,51 @@ def get_audio_duration(audio_path: str) -> float:
     return float(out)
 
 # === PASO 3: DESCARGA DE MATERIAL VISUAL (PEXELS VIDEO HD + FALLBACK IA) ===
+# === PASO 3: DESCARGA DE MATERIAL VISUAL VALIDADA (SIN LOOP INFINITO) ===
+def is_valid_image(file_path: str) -> bool:
+    """Verifica que el archivo descargado sea realmente un JPEG, PNG o WebP y no un error HTML."""
+    if not os.path.exists(file_path) or os.path.getsize(file_path) < 5000:
+        return False
+    with open(file_path, "rb") as f:
+        header = f.read(12)
+    # Firmas mágicas de JPEG (\xff\xd8), PNG (\x89PNG) y WEBP (RIFF...WEBP)
+    return header.startswith(b"\xff\xd8") or header.startswith(b"\x89PNG") or (header.startswith(b"RIFF") and b"WEBP" in header)
+
+async def download_valid_image(client: httpx.AsyncClient, term: str, idx: int, img_file: str) -> bool:
+    clean_term = re.sub(r"[^a-zA-Z0-9 ]", "", term).strip()
+    encoded = urllib.parse.quote(f"{clean_term}, vertical 9:16, cinematic, 8k")
+    keywords = ",".join(clean_term.split()[:3]) or "space,nature"
+
+    # Lista de proveedores gratuitos en cascada (IA -> Fotos HD temáticas -> Fotos HD aleatorias)
+    urls = [
+        f"https://image.pollinations.ai/prompt/{encoded}?width=1080&height=1920&nologo=true&model=flux&seed={idx+200}",
+        f"https://loremflickr.com/1080/1920/{urllib.parse.quote(keywords)}?lock={idx+10}",
+        f"https://picsum.photos/seed/{idx+500}/1080/1920"
+    ]
+
+    for url in urls:
+        try:
+            resp = await client.get(url, timeout=25.0)
+            if resp.status_code == 200:
+                with open(img_file, "wb") as f:
+                    f.write(resp.content)
+                if is_valid_image(img_file):
+                    print(f"Imagen válida descargada para escena {idx} desde: {url.split('/')[2]}")
+                    return True
+        except Exception as e:
+            print(f"Aviso descargando de {url.split('/')[2]}: {e}")
+    return False
+
 async def get_visual_clips(search_terms: list[str], total_duration: float) -> list[str]:
     clip_paths = []
     clip_duration = max(total_duration / len(search_terms), 2.5)
 
-    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True, headers=BROWSER_HEADERS) as client:
+    async with httpx.AsyncClient(timeout=45.0, follow_redirects=True, headers=BROWSER_HEADERS) as client:
         for i, term in enumerate(search_terms):
             clip_file = f"output/clip_{i}.mp4"
-            got_pexels = False
+            got_clip = False
 
+            # 1. Intentar video real de Pexels si hay API Key
             if PEXELS_API_KEY:
                 try:
                     pexels_url = f"https://api.pexels.com/videos/search?query={urllib.parse.quote(term)}&orientation=portrait&size=medium&per_page=3"
@@ -189,29 +225,32 @@ async def get_visual_clips(search_terms: list[str], total_duration: float) -> li
                         with open(raw_vid, "wb") as f:
                             f.write(vid_data.content)
                         subprocess.run([
-                            "ffmpeg", "-y", "-stream_loop", "-1", "-i", raw_vid,
-                            "-t", str(clip_duration),
+                            "ffmpeg", "-y", "-stream_loop", "-1", "-t", str(clip_duration), "-i", raw_vid,
                             "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30",
                             "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", clip_file
                         ], check=True)
-                        got_pexels = True
+                        got_clip = True
                 except Exception as e:
                     print(f"Pexels fallback en escena {i}: {e}")
 
-            if not got_pexels:
-                encoded = urllib.parse.quote(f"{term}, vertical 9:16, cinematic lighting, 8k, hyperrealistic")
-                url = f"https://image.pollinations.ai/prompt/{encoded}?width=1080&height=1920&nologo=true&seed={i+105}"
+            # 2. Descargar imagen validada y aplicar Zoom seguro (con límite de tiempo de entrada)
+            if not got_clip:
                 img_file = f"output/img_{i}.jpg"
-                resp = await client.get(url)
-                with open(img_file, "wb") as f:
-                    f.write(resp.content)
-
+                has_img = await download_valid_image(client, term, i, img_file)
                 frames = int(clip_duration * 30)
-                subprocess.run([
-                    "ffmpeg", "-y", "-loop", "1", "-i", img_file,
-                    "-vf", f"scale=1200:-1,zoompan=z='min(zoom+0.0015,1.25)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1080x1920:fps=30",
-                    "-t", str(clip_duration), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", clip_file
-                ], check=True)
+
+                if has_img:
+                    subprocess.run([
+                        "ffmpeg", "-y", "-loop", "1", "-t", str(clip_duration), "-i", img_file,
+                        "-vf", f"scale=1200:2134:force_original_aspect_ratio=increase,crop=1200:2134,zoompan=z='min(zoom+0.0015,1.25)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1080x1920:fps=30",
+                        "-t", str(clip_duration), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", clip_file
+                    ], check=True)
+                else:
+                    # Respaldo de emergencia generado por FFmpeg si todas las webs fallan
+                    subprocess.run([
+                        "ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=0x111827:s=1080x1920:d={clip_duration}:r=30",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", clip_file
+                    ], check=True)
 
             clip_paths.append(str(os.path.abspath(clip_file)))
     return clip_paths
