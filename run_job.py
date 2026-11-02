@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import glob
 import asyncio
 import subprocess
@@ -23,6 +22,8 @@ BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 }
 
+ACTIVE_GROQ_MODEL = None
+
 async def send_telegram(text: str):
     print(text)
     if not BOT_TOKEN or not CHAT_ID:
@@ -34,58 +35,110 @@ async def send_telegram(text: str):
         except Exception as e:
             print(f"Aviso Telegram: {e}")
 
-# === PASO 1: GENERADOR MODULAR ESTILO MONEYPRINTERTURBO (NUNCA FALLA EL JSON) ===
-async def ask_groq(prompt: str, system: str = "You are a helpful assistant.") -> str:
-    if not GROQ_API_KEY:
-        raise RuntimeError("Falta GROQ_API_KEY en los Secrets de GitHub.")
-    headers = {
-        **BROWSER_HEADERS,
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    async with httpx.AsyncClient(timeout=45.0) as client:
+# === AUTO-DETECTOR DE MODELOS ACTIVOS EN GROQ + RESPALDO GRATUITO ===
+async def get_working_groq_model(client: httpx.AsyncClient, headers: dict) -> str:
+    global ACTIVE_GROQ_MODEL
+    if ACTIVE_GROQ_MODEL:
+        return ACTIVE_GROQ_MODEL
+
+    res = await client.get("https://api.groq.com/openai/v1/models", headers=headers)
+    if res.status_code != 200:
+        raise RuntimeError(f"Error consultando modelos en Groq ({res.status_code}): {res.text}")
+
+    all_models = [m["id"] for m in res.json().get("data", [])]
+    # Filtrar modelos de audio, visión pura o moderación (guard)
+    chat_models = [
+        m for m in all_models
+        if not any(x in m.lower() for x in ["whisper", "guard", "tts", "playai", "vision", "embed", "orpheus"])
+    ]
+    print(f"Modelos de texto disponibles en tu cuenta Groq: {chat_models}")
+
+    # Priorizar modelos de mayor calidad (70b, llama-4, qwen, deepseek, 8b)
+    for keyword in ["70b", "llama-4", "qwen", "deepseek", "llama-3", "llama3", "gemma", "mixtral", "8b"]:
+        for m in chat_models:
+            if keyword in m.lower():
+                ACTIVE_GROQ_MODEL = m
+                print(f"--> Modelo seleccionado automáticamente: {ACTIVE_GROQ_MODEL}")
+                return ACTIVE_GROQ_MODEL
+
+    if chat_models:
+        ACTIVE_GROQ_MODEL = chat_models[0]
+        return ACTIVE_GROQ_MODEL
+
+    raise RuntimeError("No se encontraron modelos de chat activos en esta cuenta de Groq.")
+
+async def ask_llm(prompt: str, system: str = "You are a helpful assistant.") -> str:
+    # Intento 1: Groq con detección dinámica del modelo activo
+    if GROQ_API_KEY:
+        headers = {
+            **BROWSER_HEADERS,
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            try:
+                model_name = await get_working_groq_model(client, headers)
+                res = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": model_name,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": prompt}
+                        ],
+                        "temperature": 0.6,
+                        "max_tokens": 1000
+                    }
+                )
+                if res.status_code == 200:
+                    content = res.json()["choices"][0]["message"]["content"]
+                    # Limpiar bloques <think>...</think> por si selecciona un modelo razonador (DeepSeek/Qwen)
+                    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                    return content
+                print(f"Aviso Groq ({res.status_code}): {res.text}. Usando motor de respaldo...")
+            except Exception as e:
+                print(f"Aviso en Groq: {e}. Saltando al motor gratuito de respaldo...")
+
+    # Intento 2 (Respaldo infalible sin API Key): Pollinations OpenAI
+    async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS) as client:
         res = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers,
+            "https://text.pollinations.ai/openai",
             json={
-                "model": "llama-3.3-70b-versatile",
+                "model": "openai",
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": prompt}
-                ],
-                "temperature": 0.6,
-                "max_tokens": 1000
+                ]
             }
         )
-        if res.status_code != 200:
-            raise RuntimeError(f"Error Groq ({res.status_code}): {res.text}")
-        return res.json()["choices"][0]["message"]["content"].strip()
+        res.raise_for_status()
+        content = res.json()["choices"][0]["message"]["content"]
+        return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
+# === PASO 1: GENERADOR MODULAR ESTILO MONEYPRINTERTURBO ===
 async def generate_mpt_content(topic: str) -> dict:
-    # 1. Generar Guion en texto plano puro (Método MoneyPrinterTurbo)
     script_prompt = (
         f"Escribe un guion para un YouTube Short viral de 35 segundos sobre: '{topic}'. "
         "REGLAS ESTRICTAS: Devuelve ÚNICAMENTE el texto que dirá el narrador en español neutro. "
         "No incluyas títulos, ni etiquetas como 'Narrador:', ni emojis, ni asteriscos, ni acotaciones entre paréntesis. "
         "Escribe todo en un solo párrafo fluido y atrapante."
     )
-    script = await ask_groq(script_prompt)
+    script = await ask_llm(script_prompt)
     script = re.sub(r"[\*\#\[\]\(\)]", "", script).strip()
 
-    # 2. Generar Título corto en texto plano
     title_prompt = (
         f"Crea un título viral y curioso de máximo 60 caracteres para un video sobre '{topic}'. "
-        "Devuelve SOLO el título, sin comillas ni texto extra."
+        "Devuelve SOLO el título en español, sin comillas ni texto extra."
     )
-    title = (await ask_groq(title_prompt)).replace('"', '').strip()[:70]
+    title = (await ask_llm(title_prompt)).replace('"', '').splitlines()[0].strip()[:70]
 
-    # 3. Extraer 5 términos de búsqueda visual en inglés (Método MoneyPrinterTurbo)
     terms_prompt = (
-        f"Based on this script: '{script}', provide exactly 5 visual search terms or scene descriptions in English "
+        f"Based on this script: '{script}', provide exactly 5 visual scene descriptions in English "
         "separated by a comma. Return ONLY the 5 comma-separated items, nothing else. "
         "Example: galaxies spinning in space, antique pocket watch, futuristic city night, glowing brain neurons, dark ocean waves"
     )
-    raw_terms = await ask_groq(terms_prompt)
+    raw_terms = await ask_llm(terms_prompt)
     search_terms = [t.strip() for t in raw_terms.split(",") if t.strip()][:5]
     while len(search_terms) < 5:
         search_terms.append("cinematic abstract universe background")
@@ -123,7 +176,6 @@ async def get_visual_clips(search_terms: list[str], total_duration: float) -> li
             clip_file = f"output/clip_{i}.mp4"
             got_pexels = False
 
-            # Si el usuario configuró PEXELS_API_KEY, descarga video real en HD como MoneyPrinterTurbo
             if PEXELS_API_KEY:
                 try:
                     pexels_url = f"https://api.pexels.com/videos/search?query={urllib.parse.quote(term)}&orientation=portrait&size=medium&per_page=3"
@@ -146,7 +198,6 @@ async def get_visual_clips(search_terms: list[str], total_duration: float) -> li
                 except Exception as e:
                     print(f"Pexels fallback en escena {i}: {e}")
 
-            # Fallback automático con IA (Pollinations Flux) + Zoom dinámico
             if not got_pexels:
                 encoded = urllib.parse.quote(f"{term}, vertical 9:16, cinematic lighting, 8k, hyperrealistic")
                 url = f"https://image.pollinations.ai/prompt/{encoded}?width=1080&height=1920&nologo=true&seed={i+105}"
@@ -171,12 +222,10 @@ async def build_video(script_text: str, search_terms: list[str]) -> str:
     ass_path = "output/subs.ass"
     final_video = "output/final_short.mp4"
 
-    # 1. Generar voz con Edge-TTS
     communicate = edge_tts.Communicate(script_text, voice="es-ES-AlvaroNeural", rate="+8%")
     await communicate.save(audio_path)
     total_duration = get_audio_duration(audio_path)
-
-    # 2. Generar subtítulos estilo MoneyPrinterTurbo ( bloques de 1-2 palabras centrados )
+    
     words = script_text.split()
     time_per_word = total_duration / max(len(words), 1)
 
@@ -201,7 +250,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             if clean_word:
                 f.write(f"Dialogue: 0,{start},{end},Viral,,0,0,0,,{clean_word}\n")
 
-    # 3. Obtener clips visuales y ensamblar con FFmpeg
     clip_paths = await get_visual_clips(search_terms, total_duration)
 
     concat_file = "output/concat.txt"
@@ -270,4 +318,4 @@ async def main():
         raise e
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main())                                        
