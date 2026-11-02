@@ -12,10 +12,10 @@ jobs:
       - name: Descargar código
         uses: actions/checkout@v4
 
-      - name: Instalar FFmpeg y librerías ligeras
+      - name: Instalar FFmpeg, eSpeak y Kokoro
         run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg fonts-liberation
-          pip install httpx edge-tts google-api-python-client google-auth-oauthlib google-auth-httplib2
+          sudo apt-get update && sudo apt-get install -y ffmpeg fonts-liberation espeak-ng
+          pip install httpx kokoro soundfile google-api-python-client google-auth-oauthlib google-auth-httplib2
 
       - name: Cargar Tokens de YouTube desde Secrets
         env:
