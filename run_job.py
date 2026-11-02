@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import glob
 import asyncio
@@ -11,10 +12,16 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
+# === CONFIGURACIÓN Y VARIABLES DE ENTORNO ===
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
-TOPIC = os.getenv("TOPIC") or "Las 3 paradojas más extrañas del tiempo"
+PEXELS_API_KEY = (os.getenv("PEXELS_API_KEY") or "").strip()
+TOPIC = (os.getenv("TOPIC") or "Las 3 paradojas más extrañas del tiempo").strip()
 CHAT_ID = (os.getenv("CHAT_ID") or "").strip()
+
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+}
 
 async def send_telegram(text: str):
     print(text)
@@ -22,8 +29,76 @@ async def send_telegram(text: str):
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     async with httpx.AsyncClient() as client:
-        await client.post(url, json={"chat_id": int(CHAT_ID), "text": text})
+        try:
+            await client.post(url, json={"chat_id": int(CHAT_ID), "text": text})
+        except Exception as e:
+            print(f"Aviso Telegram: {e}")
 
+# === PASO 1: GENERADOR MODULAR ESTILO MONEYPRINTERTURBO (NUNCA FALLA EL JSON) ===
+async def ask_groq(prompt: str, system: str = "You are a helpful assistant.") -> str:
+    if not GROQ_API_KEY:
+        raise RuntimeError("Falta GROQ_API_KEY en los Secrets de GitHub.")
+    headers = {
+        **BROWSER_HEADERS,
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        res = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.6,
+                "max_tokens": 1000
+            }
+        )
+        if res.status_code != 200:
+            raise RuntimeError(f"Error Groq ({res.status_code}): {res.text}")
+        return res.json()["choices"][0]["message"]["content"].strip()
+
+async def generate_mpt_content(topic: str) -> dict:
+    # 1. Generar Guion en texto plano puro (Método MoneyPrinterTurbo)
+    script_prompt = (
+        f"Escribe un guion para un YouTube Short viral de 35 segundos sobre: '{topic}'. "
+        "REGLAS ESTRICTAS: Devuelve ÚNICAMENTE el texto que dirá el narrador en español neutro. "
+        "No incluyas títulos, ni etiquetas como 'Narrador:', ni emojis, ni asteriscos, ni acotaciones entre paréntesis. "
+        "Escribe todo en un solo párrafo fluido y atrapante."
+    )
+    script = await ask_groq(script_prompt)
+    script = re.sub(r"[\*\#\[\]\(\)]", "", script).strip()
+
+    # 2. Generar Título corto en texto plano
+    title_prompt = (
+        f"Crea un título viral y curioso de máximo 60 caracteres para un video sobre '{topic}'. "
+        "Devuelve SOLO el título, sin comillas ni texto extra."
+    )
+    title = (await ask_groq(title_prompt)).replace('"', '').strip()[:70]
+
+    # 3. Extraer 5 términos de búsqueda visual en inglés (Método MoneyPrinterTurbo)
+    terms_prompt = (
+        f"Based on this script: '{script}', provide exactly 5 visual search terms or scene descriptions in English "
+        "separated by a comma. Return ONLY the 5 comma-separated items, nothing else. "
+        "Example: galaxies spinning in space, antique pocket watch, futuristic city night, glowing brain neurons, dark ocean waves"
+    )
+    raw_terms = await ask_groq(terms_prompt)
+    search_terms = [t.strip() for t in raw_terms.split(",") if t.strip()][:5]
+    while len(search_terms) < 5:
+        search_terms.append("cinematic abstract universe background")
+
+    return {
+        "title": title,
+        "description": f"{title}\n\n{script[:150]}...\n\n#Shorts #Curiosidades #DatosCuriosos",
+        "tags": ["shorts", "curiosidades", "datos", "misterios", "ciencia"],
+        "script": script,
+        "search_terms": search_terms
+    }
+
+# === PASO 2: VOZ Y SUBTÍTULOS NATIVOS (EDGE-TTS) ===
 def format_ass_time(seconds: float) -> str:
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
@@ -31,116 +106,79 @@ def format_ass_time(seconds: float) -> str:
     cs = int((seconds % 1) * 100)
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
-async def get_active_groq_model(client: httpx.AsyncClient, headers: dict) -> str:
-    """Detecta automáticamente el mejor modelo activo hoy en Groq para evitar errores 404."""
-    res = await client.get("https://api.groq.com/openai/v1/models", headers=headers)
-    if res.status_code != 200:
-        raise RuntimeError(f"Error autenticando en Groq ({res.status_code}): {res.text}")
-    
-    available = [m["id"] for m in res.json().get("data", []) if "whisper" not in m["id"] and "tts" not in m["id"] and "guard" not in m["id"]]
-    print(f"Modelos activos detectados en Groq: {available}")
+def get_audio_duration(audio_path: str) -> float:
+    out = subprocess.check_output([
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", audio_path
+    ]).decode().strip()
+    return float(out)
 
-    # Orden de preferencia
-    preferred = [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
-        "llama3-70b-8192",
-        "llama3-8b-8192",
-        "qwen-qwq-32b",
-        "gemma2-9b-it"
-    ]
-    for p in preferred:
-        if p in available:
-            return p
-    # Si todos cambiaron de nombre, elige el primer modelo Llama o general disponible
-    for m in available:
-        if "llama" in m.lower():
-            return m
-    return available[0]
+# === PASO 3: DESCARGA DE MATERIAL VISUAL (PEXELS VIDEO HD + FALLBACK IA) ===
+async def get_visual_clips(search_terms: list[str], total_duration: float) -> list[str]:
+    clip_paths = []
+    clip_duration = max(total_duration / len(search_terms), 2.5)
 
-import re
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True, headers=BROWSER_HEADERS) as client:
+        for i, term in enumerate(search_terms):
+            clip_file = f"output/clip_{i}.mp4"
+            got_pexels = False
 
-async def generate_script(topic: str) -> dict:
-    prompt = f"""Crea un YouTube Short viral de 35 segundos sobre: "{topic}".
-Responde UNICAMENTE con un objeto JSON válido (sin texto adicional ni bloques markdown), asegurándote de cerrar todas las comillas y llaves:
-{{
-  "title": "Título magnético con gancho (máx 70 caracteres)",
-  "description": "Descripción SEO atractiva con hashtags",
-  "tags": ["curiosidades", "datos", "shorts"],
-  "script": "Guion narrado en español neutro en un solo párrafo continuo sin saltos de línea ni emojis, directo para leer en voz alta.",
-  "image_prompts": [
-    "Detailed vertical 9:16 visual prompt in English for scene 1",
-    "Detailed vertical 9:16 visual prompt in English for scene 2",
-    "Detailed vertical 9:16 visual prompt in English for scene 3",
-    "Detailed vertical 9:16 visual prompt in English for scene 4",
-    "Detailed vertical 9:16 visual prompt in English for scene 5"
-  ]
-}}"""
+            # Si el usuario configuró PEXELS_API_KEY, descarga video real en HD como MoneyPrinterTurbo
+            if PEXELS_API_KEY:
+                try:
+                    pexels_url = f"https://api.pexels.com/videos/search?query={urllib.parse.quote(term)}&orientation=portrait&size=medium&per_page=3"
+                    r = await client.get(pexels_url, headers={"Authorization": PEXELS_API_KEY})
+                    videos = r.json().get("videos", [])
+                    if videos:
+                        video_files = videos[0].get("video_files", [])
+                        best_file = next((vf for vf in video_files if vf.get("width", 0) >= 720 and vf.get("height", 0) > vf.get("width", 0)), video_files[0])
+                        vid_data = await client.get(best_file["link"])
+                        raw_vid = f"output/raw_{i}.mp4"
+                        with open(raw_vid, "wb") as f:
+                            f.write(vid_data.content)
+                        subprocess.run([
+                            "ffmpeg", "-y", "-stream_loop", "-1", "-i", raw_vid,
+                            "-t", str(clip_duration),
+                            "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30",
+                            "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", clip_file
+                        ], check=True)
+                        got_pexels = True
+                except Exception as e:
+                    print(f"Pexels fallback en escena {i}: {e}")
 
-    async with httpx.AsyncClient(timeout=45.0, headers=BROWSER_HEADERS) as client:
-        if GROQ_API_KEY:
-            print("Generando guion con Groq API...")
-            headers = {
-                **BROWSER_HEADERS,
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            }
-            res = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers=headers,
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": [
-                        {"role": "system", "content": "You are a JSON generator. Always output valid, complete JSON only."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    "temperature": 0.5,
-                    "max_tokens": 1500
-                }
-            )
-            if res.status_code != 200:
-                raise RuntimeError(f"Error en Groq API ({res.status_code}): {res.text}")
-            
-            raw_text = res.json()["choices"][0]["message"]["content"]
-            match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-            if not match:
-                raise RuntimeError(f"No se encontró JSON en la respuesta: {raw_text}")
-            
-            clean_json = match.group(0)
-            return json.loads(clean_json, strict=False)
+            # Fallback automático con IA (Pollinations Flux) + Zoom dinámico
+            if not got_pexels:
+                encoded = urllib.parse.quote(f"{term}, vertical 9:16, cinematic lighting, 8k, hyperrealistic")
+                url = f"https://image.pollinations.ai/prompt/{encoded}?width=1080&height=1920&nologo=true&seed={i+105}"
+                img_file = f"output/img_{i}.jpg"
+                resp = await client.get(url)
+                with open(img_file, "wb") as f:
+                    f.write(resp.content)
 
-        raise RuntimeError("No se encontró GROQ_API_KEY en Repository secrets.")
+                frames = int(clip_duration * 30)
+                subprocess.run([
+                    "ffmpeg", "-y", "-loop", "1", "-i", img_file,
+                    "-vf", f"scale=1200:-1,zoompan=z='min(zoom+0.0015,1.25)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1080x1920:fps=30",
+                    "-t", str(clip_duration), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", clip_file
+                ], check=True)
 
-async def transcribe_groq_whisper(audio_path: str) -> tuple[list, float]:
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        with open(audio_path, "rb") as f:
-            res = await client.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                files={"file": ("voice.mp3", f, "audio/mpeg")},
-                data={
-                    "model": "whisper-large-v3-turbo",
-                    "response_format": "verbose_json",
-                    "timestamp_granularities[]": "word"
-                }
-            )
-            if res.status_code != 200:
-                raise RuntimeError(f"Groq Whisper Error ({res.status_code}): {res.text}")
-            data = res.json()
-            return data.get("words", []), float(data.get("duration", 35.0))
+            clip_paths.append(str(os.path.abspath(clip_file)))
+    return clip_paths
 
-async def build_video(script_text: str, image_prompts: list[str]) -> str:
+async def build_video(script_text: str, search_terms: list[str]) -> str:
     os.makedirs("output", exist_ok=True)
     audio_path = "output/voice.mp3"
     ass_path = "output/subs.ass"
     final_video = "output/final_short.mp4"
 
-    # 1. Voz Neuronal Gratis (Edge-TTS)
+    # 1. Generar voz con Edge-TTS
     communicate = edge_tts.Communicate(script_text, voice="es-ES-AlvaroNeural", rate="+8%")
     await communicate.save(audio_path)
+    total_duration = get_audio_duration(audio_path)
 
-    # 2. Subtítulos palabra por palabra vía Groq Whisper API
-    words, total_duration = await transcribe_groq_whisper(audio_path)
+    # 2. Generar subtítulos estilo MoneyPrinterTurbo ( bloques de 1-2 palabras centrados )
+    words = script_text.split()
+    time_per_word = total_duration / max(len(words), 1)
 
     ass_header = """[Script Info]
 ScriptType: v4.00+
@@ -156,36 +194,16 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     with open(ass_path, "w", encoding="utf-8") as f:
         f.write(ass_header)
-        for w in words:
-            start = format_ass_time(float(w["start"]))
-            end = format_ass_time(float(w["end"]))
-            clean_word = w["word"].strip().upper().replace("{", "").replace("}", "")
+        for idx, w in enumerate(words):
+            start = format_ass_time(idx * time_per_word)
+            end = format_ass_time((idx + 1) * time_per_word)
+            clean_word = w.strip().upper().replace("{", "").replace("}", "")
             if clean_word:
                 f.write(f"Dialogue: 0,{start},{end},Viral,,0,0,0,,{clean_word}\n")
 
-    # 3. Descargar imágenes con Flux (Pollinations) y aplicar Zoom con FFmpeg
-    clip_paths = []
-    clip_duration = max(total_duration / len(image_prompts), 2.5)
+    # 3. Obtener clips visuales y ensamblar con FFmpeg
+    clip_paths = await get_visual_clips(search_terms, total_duration)
 
-    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-        for i, prompt in enumerate(image_prompts):
-            encoded = urllib.parse.quote(f"{prompt}, vertical 9:16, cinematic lighting, 8k, hyperrealistic")
-            url = f"https://image.pollinations.ai/prompt/{encoded}?width=1080&height=1920&nologo=true&seed={i+100}"
-            img_file = f"output/img_{i}.jpg"
-            resp = await client.get(url)
-            with open(img_file, "wb") as f:
-                f.write(resp.content)
-
-            clip_file = f"output/clip_{i}.mp4"
-            frames = int(clip_duration * 30)
-            subprocess.run([
-                "ffmpeg", "-y", "-loop", "1", "-i", img_file,
-                "-vf", f"scale=1200:-1,zoompan=z='min(zoom+0.0015,1.25)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1080x1920:fps=30",
-                "-t", str(clip_duration), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", clip_file
-            ], check=True)
-            clip_paths.append(str(os.path.abspath(clip_file)))
-
-    # 4. Unir escenas y quemar subtítulos + audio
     concat_file = "output/concat.txt"
     with open(concat_file, "w") as f:
         for cp in clip_paths:
@@ -201,10 +219,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     return final_video
 
+# === PASO 4: SUBIDA A YOUTUBE CON ROTADOR MULTI-PROYECTO ===
 def upload_youtube_rotated(video_path: str, title: str, description: str, tags: list[str]) -> str:
     token_files = sorted(glob.glob("tokens/token_*.json"))
     if not token_files:
-        raise RuntimeError("No se encontraron archivos token_*.json en /tokens")
+        raise RuntimeError("No se encontraron archivos token_*.json. Revisa el secreto YT_TOKEN_1.")
 
     for token_path in token_files:
         try:
@@ -213,7 +232,7 @@ def upload_youtube_rotated(video_path: str, title: str, description: str, tags: 
             body = {
                 "snippet": {
                     "title": title[:100],
-                    "description": f"{description}\n\n#Shorts",
+                    "description": description,
                     "tags": tags,
                     "categoryId": "27"
                 },
@@ -234,11 +253,13 @@ def upload_youtube_rotated(video_path: str, title: str, description: str, tags: 
 
 async def main():
     try:
-        await send_telegram(f"🧠 Creando guion y escenas para: '{TOPIC}'...")
-        plan = await generate_script(TOPIC)
+        await send_telegram(f"🧠 [Motor MoneyPrinter] Creando guion para: '{TOPIC}'...")
+        plan = await generate_mpt_content(TOPIC)
+        print(f"Título generado: {plan['title']}")
+        print(f"Escenas: {plan['search_terms']}")
 
         await send_telegram(f"🎬 Renderizando Short: {plan['title']}...")
-        video_path = await build_video(plan["script"], plan["image_prompts"])
+        video_path = await build_video(plan["script"], plan["search_terms"])
 
         await send_telegram("🚀 Subiendo a YouTube con rotador OAuth...")
         yt_url = upload_youtube_rotated(video_path, plan["title"], plan["description"], plan["tags"])
