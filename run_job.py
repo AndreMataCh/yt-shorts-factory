@@ -197,7 +197,7 @@ async def render_video(prefix: str, script_text: str, search_terms: list[str], i
     ass_path = f"output/{prefix}_subs.ass"
     final_video = f"output/{prefix}_final.mp4"
 
-    communicate = edge_tts.Communicate(script_text, voice="es-ES-AlvaroNeural", rate="+8%" if is_short else "+4%")
+    communicate = edge_tts.Communicate(script_text, voice="es-AR-TomasNeural", rate="+8%" if is_short else "+4%")
     await communicate.save(audio_path)
     total_duration = get_audio_duration(audio_path)
 
