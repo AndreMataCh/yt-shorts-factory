@@ -23,14 +23,25 @@ jobs:
           pip install --upgrade pip
           pip install httpx kokoro soundfile numpy google-api-python-client google-auth-oauthlib google-auth-httplib2
 
-      - name: Cargar Tokens de YouTube desde Secrets
+      - name: Cargar Tokens Multi-Canal de YouTube desde Secrets
         env:
           YT_TOKEN_1: ${{ secrets.YT_TOKEN_1 }}
           YT_TOKEN_2: ${{ secrets.YT_TOKEN_2 }}
+          YT_CH1_TOKEN_1: ${{ secrets.YT_CH1_TOKEN_1 }}
+          YT_CH2_TOKEN_1: ${{ secrets.YT_CH2_TOKEN_1 }}
+          YT_CH2_TOKEN_2: ${{ secrets.YT_CH2_TOKEN_2 }}
+          YT_CH3_TOKEN_1: ${{ secrets.YT_CH3_TOKEN_1 }}
         run: |
           mkdir -p tokens output
-          if [ -n "$YT_TOKEN_1" ]; then echo "$YT_TOKEN_1" > tokens/token_1.json; fi
-          if [ -n "$YT_TOKEN_2" ]; then echo "$YT_TOKEN_2" > tokens/token_2.json; fi
+          # Canal 1 (compatible con tus secretos actuales YT_TOKEN_1 y YT_TOKEN_2)
+          if [ -n "$YT_TOKEN_1" ]; then echo "$YT_TOKEN_1" > tokens/ch1_token_1.json; fi
+          if [ -n "$YT_TOKEN_2" ]; then echo "$YT_TOKEN_2" > tokens/ch1_token_2.json; fi
+          if [ -n "$YT_CH1_TOKEN_1" ]; then echo "$YT_CH1_TOKEN_1" > tokens/ch1_token_3.json; fi
+          # Canal 2
+          if [ -n "$YT_CH2_TOKEN_1" ]; then echo "$YT_CH2_TOKEN_1" > tokens/ch2_token_1.json; fi
+          if [ -n "$YT_CH2_TOKEN_2" ]; then echo "$YT_CH2_TOKEN_2" > tokens/ch2_token_2.json; fi
+          # Canal 3
+          if [ -n "$YT_CH3_TOKEN_1" ]; then echo "$YT_CH3_TOKEN_1" > tokens/ch3_token_1.json; fi
 
       - name: Ejecutar Fábrica
         env:
@@ -38,7 +49,9 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          CHANNEL_ID: ${{ github.event.client_payload.channel_id || 'ch1' }}
           TOPIC: ${{ github.event.client_payload.topic || 'Las 3 paradojas más extrañas del tiempo' }}
+          VISUAL_STYLE: ${{ github.event.client_payload.visual_style || '1' }}
           VOICE_STYLE: ${{ github.event.client_payload.voice_style || '1' }}
           VIDEO_COUNT: ${{ github.event.client_payload.video_count || '1' }}
           MODE: ${{ github.event.client_payload.mode || '3' }}
