@@ -35,6 +35,7 @@ BROWSER_HEADERS = {
 }
 
 CACHED_GROQ_MODELS = []
+CACHED_GEMINI_MODELS = []
 
 print("Inicializando motor neuronal Kokoro-82M (Español 'e')...")
 kokoro_pipeline = KPipeline(lang_code='e')
@@ -50,7 +51,54 @@ async def send_telegram(text: str):
         except Exception as e:
             print(f"Aviso Telegram: {e}")
 
-# === MOTOR LLM CON ROTACIÓN ANTI-429 EN GROQ Y FALLBACK ROBUSTO ===
+def clean_llm_output(text: str) -> str:
+    if not text:
+        return ""
+    # Eliminar bloques <think>...</think> cerrados o abiertos
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL)
+    return cleaned.strip()
+
+# === AUTODESCUBRIMIENTO DE MODELOS EN GEMINI Y GROQ ===
+async def get_ranked_gemini_models(client: httpx.AsyncClient) -> list[str]:
+    global CACHED_GEMINI_MODELS
+    if CACHED_GEMINI_MODELS:
+        return CACHED_GEMINI_MODELS
+
+    default_models = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite"]
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
+        res = await client.get(url)
+        if res.status_code == 200:
+            data = res.json().get("models", [])
+            valid = []
+            for m in data:
+                name = m.get("name", "").replace("models/", "")
+                methods = m.get("supportedGenerationMethods", [])
+                if "generateContent" in methods and not any(
+                    x in name.lower() for x in ["vision", "embedding", "imagen", "veo", "tts", "audio", "aqa", "bisheng"]
+                ):
+                    valid.append(name)
+
+            ranked = []
+            for pref in ["gemini-2.5-flash", "gemini-2.5-pro", "2.5-flash", "flash", "pro"]:
+                for v in valid:
+                    if pref in v.lower() and v not in ranked:
+                        ranked.append(v)
+            for v in valid:
+                if v not in ranked:
+                    ranked.append(v)
+
+            if ranked:
+                CACHED_GEMINI_MODELS = ranked
+                print(f"Modelos Gemini detectados: {CACHED_GEMINI_MODELS[:4]}")
+                return CACHED_GEMINI_MODELS
+    except Exception as e:
+        print(f"Aviso listando modelos Gemini: {e}")
+
+    CACHED_GEMINI_MODELS = default_models
+    return CACHED_GEMINI_MODELS
+
 async def get_ranked_groq_models(client: httpx.AsyncClient, headers: dict) -> list[str]:
     global CACHED_GROQ_MODELS
     if CACHED_GROQ_MODELS:
@@ -66,108 +114,106 @@ async def get_ranked_groq_models(client: httpx.AsyncClient, headers: dict) -> li
         if not any(x in m.lower() for x in ["whisper", "guard", "tts", "playai", "vision", "embed", "orpheus", "allam"])
     ]
 
-    # Priorizar modelos Llama y Gemma (alto límite de tokens/minuto, sin gasto excesivo de <think>)
-    priority_keywords = [
-        "llama-3.3-70b",
-        "llama-3.1-8b",
-        "llama3-70b",
-        "llama3-8b",
-        "llama-4",
-        "gemma2",
-        "mixtral",
-        "qwen",
-        "deepseek"
-    ]
+    # Separar modelos directos (rápidos y de alto cupo) de los modelos de razonamiento (qwen/deepseek)
+    fast_models = [m for m in chat_models if not any(r in m.lower() for r in ["qwen", "deepseek", "r1"])]
+    reasoning_models = [m for m in chat_models if m not in fast_models]
 
+    priority_keywords = ["llama-3.3", "llama-3.1", "llama-4", "llama", "gpt-oss", "kimi", "gemma", "mixtral"]
     ranked = []
     for kw in priority_keywords:
-        for m in chat_models:
+        for m in fast_models:
             if kw in m.lower() and m not in ranked:
                 ranked.append(m)
 
-    for m in chat_models:
+    for m in fast_models:
         if m not in ranked:
             ranked.append(m)
 
+    # Dejar qwen/deepseek solo como último recurso dentro de Groq
+    ranked.extend(reasoning_models)
+
     CACHED_GROQ_MODELS = ranked
+    print(f"Modelos Groq priorizados: {CACHED_GROQ_MODELS[:5]}")
     return CACHED_GROQ_MODELS
 
 async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
     errors = []
 
-    # 1. Intentar con Groq API rotando modelos automáticamente si hay Rate Limit (429)
+    # 1. Intentar con Gemini API (gemini-2.5-flash y autodescubiertos, alto cupo por minuto)
+    if GEMINI_API_KEY:
+        async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS) as client:
+            gemini_models = await get_ranked_gemini_models(client)
+            for gemini_model in gemini_models[:3]:
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={GEMINI_API_KEY}"
+                    res = await client.post(url, json={"contents": [{"parts": [{"text": prompt}]}]})
+                    if res.status_code == 200:
+                        candidates = res.json().get("candidates", [])
+                        if candidates:
+                            content = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                            cleaned = clean_llm_output(content)
+                            if cleaned:
+                                return cleaned
+                    elif res.status_code == 429:
+                        errors.append(f"Gemini 429 ({gemini_model})")
+                        await asyncio.sleep(4)
+                    else:
+                        errors.append(f"Gemini {res.status_code} ({gemini_model})")
+                except Exception as e:
+                    errors.append(f"Gemini Exception ({gemini_model}): {e}")
+
+    # 2. Intentar con Groq API (priorizando modelos Llama/Instruct sin gasto de <think>)
     if GROQ_API_KEY:
         headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         async with httpx.AsyncClient(timeout=60.0) as client:
             try:
                 models_to_try = await get_ranked_groq_models(client, headers)
                 for model_name in models_to_try[:5]:
+                    is_qwen = "qwen" in model_name.lower()
+                    effective_prompt = f"/no_think\n{prompt}" if is_qwen else prompt
+
                     res = await client.post(
                         "https://api.groq.com/openai/v1/chat/completions",
                         headers=headers,
                         json={
                             "model": model_name,
-                            "messages": [{"role": "user", "content": prompt}],
+                            "messages": [{"role": "user", "content": effective_prompt}],
                             "temperature": 0.7,
                             "max_tokens": max_tokens
                         }
                     )
                     if res.status_code == 200:
-                        content = res.json()["choices"][0]["message"]["content"]
-                        cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                        msg_obj = res.json()["choices"][0]["message"]
+                        content = msg_obj.get("content") or ""
+                        cleaned = clean_llm_output(content)
                         if cleaned:
                             return cleaned
+                        else:
+                            errors.append(f"Groq 200-vacío ({model_name})")
                     elif res.status_code == 429:
-                        print(f"Rate limit (429) en {model_name}, esperando 4s y rotando al siguiente modelo...")
+                        print(f"Rate limit (429) en {model_name}, esperando 6s y rotando...")
                         errors.append(f"Groq 429 ({model_name})")
-                        await asyncio.sleep(4)
+                        await asyncio.sleep(6)
                         continue
                     else:
                         errors.append(f"Groq {res.status_code} ({model_name})")
             except Exception as e:
                 errors.append(f"Groq Exception: {e}")
-    else:
-        errors.append("Groq API Key vacía")
 
-    # 2. Intentar con Gemini API (si está configurada)
-    if GEMINI_API_KEY:
-        async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS) as client:
-            for gemini_model in ["gemini-2.0-flash", "gemini-1.5-flash"]:
-                try:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={GEMINI_API_KEY}"
-                    res = await client.post(url, json={"contents": [{"parts": [{"text": prompt}]}]})
-                    if res.status_code == 200:
-                        content = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-                        return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-                    else:
-                        errors.append(f"Gemini ({gemini_model}) {res.status_code}")
-                except Exception as e:
-                    errors.append(f"Gemini Exception: {e}")
-
-    # 3. Respaldo Pollinations (forzando modelos directos sin razonamiento pesado)
-    async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS) as client:
-        for poll_model in ["mistral", "openai-fast", "openai"]:
-            try:
-                res = await client.post(
-                    "https://text.pollinations.ai/",
-                    json={
-                        "model": poll_model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "seed": np.random.randint(1000, 99999)
-                    }
-                )
-                if res.status_code == 200:
-                    if "application/json" in res.headers.get("content-type", ""):
-                        content = res.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-                    else:
-                        content = res.text
-                    cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-                    if cleaned:
-                        return cleaned
-                else:
-                    errors.append(f"Pollinations ({poll_model}) {res.status_code}")
-            except Exception as e:
-                errors.append(f"Pollinations ({poll_model}) Exception: {e}")
+    # 3. Respaldo Pollinations vía GET directo
+    async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS, follow_redirects=True) as client:
+        try:
+            encoded_p = urllib.parse.quote(prompt[:1500])
+            seed = np.random.randint(1000, 99999)
+            res = await client.get(f"https://text.pollinations.ai/{encoded_p}?seed={seed}")
+            if res.status_code == 200 and res.text.strip():
+                cleaned = clean_llm_output(res.text)
+                if cleaned:
+                    return cleaned
+            else:
+                errors.append(f"Pollinations GET {res.status_code}")
+        except Exception as e:
+            errors.append(f"Pollinations Exception: {e}")
 
     detailed_error = " | ".join(errors)
     raise RuntimeError(f"Falla total de LLMs. Detalles: {detailed_error}")
@@ -181,7 +227,7 @@ async def analyze_niche_competitors(main_topic: str) -> dict:
         f"Para el nicho o tema general: '{main_topic}':\n"
         f"1. Identifica las 2 estrategias o ganchos psicológicos principales que utilizan los canales más exitosos de este nicho para retener audiencia.\n"
         f"2. Basándote en esos patrones ganadores, diseña un subtema o enfoque específico altamente magnético y novedoso.\n"
-        f"3. Devuelve la respuesta en este formato exacto de texto:\n"
+        f"3. Devuelve la respuesta sin razonamientos previos en este formato exacto de texto:\n"
         f"ESTRATEGIA: [Explica brevemente la estrategia de la competencia]\n"
         f"TEMA_OPTIMIZADO: [El título o enfoque exacto perfeccionado para el video]\n"
         f"GANCHO: [La frase exacta con la que debe iniciar el guion para atrapar al usuario en 3 segundos]"
@@ -231,14 +277,14 @@ async def generate_long_plan(topic: str) -> dict:
         "Estructura: Gancho inicial impactante, desarrollo con datos sorprendentes y conclusión reflexiva. "
         "REGLAS ESTRICTAS: Devuelve ÚNICAMENTE el texto que dirá el narrador. Sin títulos, sin asteriscos, sin emojis."
     )
-    script = re.sub(r"[\*\#\[\]\(\)]", "", await ask_llm(script_prompt, max_tokens=1200)).strip()
-    title = (await ask_llm(f"Crea un título magnético de YouTube (máx 65 caracteres) en español para un documental sobre '{topic}'. SOLO el título sin comillas.", max_tokens=120)).replace('"', '').splitlines()[0].strip()[:75]
+    script = re.sub(r"[\*\#\[\]\(\)]", "", await ask_llm(script_prompt, max_tokens=1400)).strip()
+    title = (await ask_llm(f"Crea un título magnético de YouTube (máx 65 caracteres) en español para un documental sobre '{topic}'. SOLO el título sin comillas.", max_tokens=150)).replace('"', '').splitlines()[0].strip()[:75]
 
     terms_raw = await ask_llm(
         f"For the documentary topic '{topic}', provide exactly 8 completely unique and highly specific visual search terms in English. "
         "Make them diverse (include cinematic close-ups, wide landscape shots, abstract conceptual imagery, dynamic movement). "
         "Return ONLY the 8 comma-separated terms.",
-        max_tokens=200
+        max_tokens=250
     )
     terms = [t.strip() for t in terms_raw.split(",") if t.strip()][:8]
     while len(terms) < 8:
@@ -266,12 +312,12 @@ async def generate_teaser_short_plan(topic: str, long_title: str, long_url: str,
             "REGLAS: Devuelve ÚNICAMENTE el texto hablado en español neutro, sin asteriscos ni emojis."
         )
 
-    script = re.sub(r"[\*\#\[\]\(\)]", "", await ask_llm(script_prompt, max_tokens=500)).strip()
-    title = (await ask_llm(f"Crea un título corto y misterioso (máx 55 caracteres) para un Short sobre '{topic}'. SOLO el título sin comillas.", max_tokens=120)).replace('"', '').splitlines()[0].strip()[:65]
+    script = re.sub(r"[\*\#\[\]\(\)]", "", await ask_llm(script_prompt, max_tokens=600)).strip()
+    title = (await ask_llm(f"Crea un título corto y misterioso (máx 55 caracteres) para un Short sobre '{topic}'. SOLO el título sin comillas.", max_tokens=150)).replace('"', '').splitlines()[0].strip()[:65]
 
     terms_raw = await ask_llm(
         f"Provide 5 distinct, high-impact cinematic visual search terms in English about '{topic}'. Make them varied and unique. Return ONLY the 5 comma-separated terms.",
-        max_tokens=150
+        max_tokens=200
     )
     terms = [t.strip() for t in terms_raw.split(",") if t.strip()][:5]
     while len(terms) < 5:
