@@ -51,7 +51,7 @@ async def send_telegram(text: str):
         except Exception as e:
             print(f"Aviso Telegram: {e}")
 
-# === MOTOR LLM CON AUTO-DETECCIÓN Y FALLBACK TRIPLE ===
+# === MOTOR LLM CON AUTO-DETECCIÓN Y FALLBACK ROBUSTO ===
 async def get_working_groq_model(client: httpx.AsyncClient, headers: dict) -> str:
     global ACTIVE_GROQ_MODEL
     if ACTIVE_GROQ_MODEL:
@@ -95,7 +95,7 @@ async def ask_llm(prompt: str, max_tokens: int = 1800) -> str:
             except Exception as e:
                 print(f"Aviso Groq: {e}")
 
-    # 2. Intentar con Gemini API si está configurada
+    # 2. Intentar con Gemini API
     if GEMINI_API_KEY:
         async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS) as client:
             try:
@@ -107,15 +107,24 @@ async def ask_llm(prompt: str, max_tokens: int = 1800) -> str:
             except Exception as e:
                 print(f"Aviso Gemini: {e}")
 
-    # 3. Respaldo gratuito sin API Key (Pollinations OpenAI)
+    # 3. Respaldo Pollinations ajustado (evita errores 400 Bad Request)
     async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS) as client:
-        res = await client.post(
-            "https://text.pollinations.ai/openai",
-            json={"model": "openai", "messages": [{"role": "user", "content": prompt}]}
-        )
-        res.raise_for_status()
-        content = res.json()["choices"][0]["message"]["content"]
-        return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        try:
+            res = await client.post(
+                "https://text.pollinations.ai/",
+                json={"messages": [{"role": "user", "content": prompt}], "seed": 42}
+            )
+            if res.status_code == 200:
+                if "application/json" in res.headers.get("content-type", ""):
+                    content = res.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+                else:
+                    content = res.text
+                if content.strip():
+                    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        except Exception as e:
+            print(f"Aviso Pollinations: {e}")
+
+    raise RuntimeError("Todas las APIs de LLM (Groq, Gemini y Pollinations) fallaron al generar el texto.")
 
 # === GENERADOR DE SUBTEMAS PARA LOTES (VIDEO_COUNT > 1) ===
 async def generate_subtopics(main_topic: str, count: int) -> list[str]:
@@ -215,12 +224,6 @@ def get_audio_duration(audio_path: str) -> float:
     return float(out)
 
 async def generate_voice_kokoro(script_text: str, audio_path: str, is_short: bool = True):
-    """
-    Genera voz neuronal en español con Kokoro-82M (24kHz nativos).
-    1: em_alex (Español Neutro Masculino)
-    2: ef_dora (Español Dinámico Femenino)
-    3: em_santa (Español Profundo / Documental)
-    """
     voice_map = {
         "1": "em_alex",
         "2": "ef_dora",
@@ -279,11 +282,9 @@ async def render_video(prefix: str, script_text: str, search_terms: list[str], i
     ass_path = f"output/{prefix}_subs.ass"
     final_video = f"output/{prefix}_final.mp4"
 
-    # 1. Generar voz en español con Kokoro-82M
     await generate_voice_kokoro(script_text, audio_path, is_short=is_short)
     total_duration = get_audio_duration(audio_path)
 
-    # 2. Generar subtítulos .ASS sincronizados
     words = script_text.split()
     time_per_word = total_duration / max(len(words), 1)
     font_size = 95 if is_short else 68
@@ -323,7 +324,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 end = format_ass_time(min((idx + chunk_size) * time_per_word, total_duration))
                 f.write(f"Dialogue: 0,{start},{end},Viral,,0,0,0,,{phrase}\n")
 
-    # 3. Obtener clips visuales (Pexels HD o Fallback IA con Zoom)
     clip_paths = []
     clip_duration = max(total_duration / len(search_terms), 3.0)
 
@@ -372,7 +372,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
             clip_paths.append(str(os.path.abspath(clip_file)))
 
-    # 4. Concatenar escenas + quemar subtítulos y audio
     concat_file = f"output/{prefix}_concat.txt"
     with open(concat_file, "w") as f:
         for cp in clip_paths:
