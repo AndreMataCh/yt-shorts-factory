@@ -72,6 +72,8 @@ async def get_working_groq_model(client: httpx.AsyncClient, headers: dict) -> st
     return ACTIVE_GROQ_MODEL
 
 async def ask_llm(prompt: str, max_tokens: int = 1800) -> str:
+    errors = []
+    
     # 1. Intentar con Groq API
     if GROQ_API_KEY:
         headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
@@ -91,22 +93,30 @@ async def ask_llm(prompt: str, max_tokens: int = 1800) -> str:
                 if res.status_code == 200:
                     content = res.json()["choices"][0]["message"]["content"]
                     return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                else:
+                    errors.append(f"Groq Error {res.status_code}: {res.text}")
             except Exception as e:
-                print(f"Aviso Groq: {e}")
+                errors.append(f"Groq Exception: {e}")
+    else:
+        errors.append("Groq API Key no configurada en Secrets.")
 
-    # 2. Intentar con Gemini API
+    # 2. Intentar con Gemini API (usando gemini-1.5-flash, altamente estable)
     if GEMINI_API_KEY:
         async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS) as client:
             try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
                 res = await client.post(url, json={"contents": [{"parts": [{"text": prompt}]}]})
                 if res.status_code == 200:
                     content = res.json()["candidates"][0]["content"]["parts"][0]["text"]
                     return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                else:
+                    errors.append(f"Gemini Error {res.status_code}: {res.text}")
             except Exception as e:
-                print(f"Aviso Gemini: {e}")
+                errors.append(f"Gemini Exception: {e}")
+    else:
+        errors.append("Gemini API Key no configurada en Secrets.")
 
-    # 3. Respaldo Pollinations ajustado (evita errores 400 Bad Request)
+    # 3. Respaldo Pollinations
     async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS) as client:
         try:
             res = await client.post(
@@ -120,11 +130,14 @@ async def ask_llm(prompt: str, max_tokens: int = 1800) -> str:
                     content = res.text
                 if content.strip():
                     return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            else:
+                errors.append(f"Pollinations Error {res.status_code}: {res.text}")
         except Exception as e:
-            print(f"Aviso Pollinations: {e}")
+            errors.append(f"Pollinations Exception: {e}")
 
-    raise RuntimeError("Todas las APIs de LLM (Groq, Gemini y Pollinations) fallaron al generar el texto.")
-
+    # Si todo falla, enviará el motivo exacto por Telegram y a la consola
+    detailed_error = " | ".join(errors)
+    raise RuntimeError(f"Falla total de LLMs. Detalles: {detailed_error}")
 # === ESTUDIO DE COMPETENCIA Y MODELADO DE ESTRATEGIAS VIRALES ===
 async def analyze_niche_competitors(main_topic: str) -> dict:
     await send_telegram(f"🔍 Analizando canales exitosos y patrones virales en el nicho: '{main_topic}'...")
