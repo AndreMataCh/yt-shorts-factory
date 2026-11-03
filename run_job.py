@@ -50,6 +50,7 @@ async def send_telegram(text: str):
         except Exception as e:
             print(f"Aviso Telegram: {e}")
 
+# === MOTOR LLM CON AUTO-DETECCIÓN Y FALLBACK ROBUSTO ===
 async def get_working_groq_model(client: httpx.AsyncClient, headers: dict) -> str:
     global ACTIVE_GROQ_MODEL
     if ACTIVE_GROQ_MODEL:
@@ -71,6 +72,7 @@ async def get_working_groq_model(client: httpx.AsyncClient, headers: dict) -> st
     return ACTIVE_GROQ_MODEL
 
 async def ask_llm(prompt: str, max_tokens: int = 1800) -> str:
+    # 1. Intentar con Groq API
     if GROQ_API_KEY:
         headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -82,7 +84,7 @@ async def ask_llm(prompt: str, max_tokens: int = 1800) -> str:
                     json={
                         "model": model_name,
                         "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.75,  # Mayor temperatura para mayor creatividad y variedad visual
+                        "temperature": 0.75,
                         "max_tokens": max_tokens
                     }
                 )
@@ -92,6 +94,7 @@ async def ask_llm(prompt: str, max_tokens: int = 1800) -> str:
             except Exception as e:
                 print(f"Aviso Groq: {e}")
 
+    # 2. Intentar con Gemini API
     if GEMINI_API_KEY:
         async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS) as client:
             try:
@@ -103,6 +106,7 @@ async def ask_llm(prompt: str, max_tokens: int = 1800) -> str:
             except Exception as e:
                 print(f"Aviso Gemini: {e}")
 
+    # 3. Respaldo Pollinations ajustado (evita errores 400 Bad Request)
     async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS) as client:
         try:
             res = await client.post(
@@ -119,7 +123,45 @@ async def ask_llm(prompt: str, max_tokens: int = 1800) -> str:
         except Exception as e:
             print(f"Aviso Pollinations: {e}")
 
-    raise RuntimeError("Todas las APIs de LLM fallaron al generar el contenido.")
+    raise RuntimeError("Todas las APIs de LLM (Groq, Gemini y Pollinations) fallaron al generar el texto.")
+
+# === ESTUDIO DE COMPETENCIA Y MODELADO DE ESTRATEGIAS VIRALES ===
+async def analyze_niche_competitors(main_topic: str) -> dict:
+    await send_telegram(f"🔍 Analizando canales exitosos y patrones virales en el nicho: '{main_topic}'...")
+    
+    prompt = (
+        f"Actúa como un estratega experto en crecimiento de YouTube y analista de datos de contenidos virales. "
+        f"Para el nicho o tema general: '{main_topic}':\n"
+        f"1. Identifica las 2 estrategias o ganchos psicológicos principales que utilizan los canales más exitosos de este nicho para retener audiencia.\n"
+        f"2. Basándote en esos patrones ganadores, diseña un subtema o enfoque específico altamente magnético y novedoso.\n"
+        f"3. Devuelve la respuesta en este formato exacto de texto:\n"
+        f"ESTRATEGIA: [Explica brevemente la estrategia de la competencia]\n"
+        f"TEMA_OPTIMIZADO: [El título o enfoque exacto perfeccionado para el video]\n"
+        f"GANCHO: [La frase exacta con la que debe iniciar el guion para atrapar al usuario en 3 segundos]"
+    )
+    
+    response = await ask_llm(prompt, max_tokens=1000)
+    
+    estrategia = "Patrones de alta retención estándar"
+    tema_optimizado = main_topic
+    gancho = ""
+    
+    for line in response.splitlines():
+        if line.startswith("ESTRATEGIA:"):
+            estrategia = line.replace("ESTRATEGIA:", "").strip()
+        elif line.startswith("TEMA_OPTIMIZADO:"):
+            tema_optimizado = line.replace("TEMA_OPTIMIZADO:", "").strip()
+        elif line.startswith("GANCHO:"):
+            gancho = line.replace("GANCHO:", "").strip()
+            
+    if not tema_optimizado:
+        tema_optimizado = main_topic
+
+    return {
+        "strategy": estrategia,
+        "topic": tema_optimizado,
+        "hook": gancho
+    }
 
 async def generate_subtopics(main_topic: str, count: int) -> list[str]:
     if count <= 1:
@@ -135,6 +177,7 @@ async def generate_subtopics(main_topic: str, count: int) -> list[str]:
         subtopics.append(f"{main_topic} - Perspectiva {len(subtopics) + 1}")
     return subtopics
 
+# === GENERADORES DE GUIONES (LARGO Y SHORT) ===
 async def generate_long_plan(topic: str) -> dict:
     script_prompt = (
         f"Escribe un guion documental fascinante y profundo en español neutro de unas 350 a 450 palabras sobre: '{topic}'. "
@@ -144,7 +187,6 @@ async def generate_long_plan(topic: str) -> dict:
     script = re.sub(r"[\*\#\[\]\(\)]", "", await ask_llm(script_prompt, max_tokens=2200)).strip()
     title = (await ask_llm(f"Crea un título magnético de YouTube (máx 65 caracteres) en español para un documental sobre '{topic}'. SOLO el título sin comillas.")).replace('"', '').splitlines()[0].strip()[:75]
 
-    # Términos visuales hiper-variados y aleatorizados para evitar repetición
     terms_raw = await ask_llm(
         f"For the documentary topic '{topic}', provide exactly 8 completely unique and highly specific visual search terms in English. "
         "Make them diverse (include cinematic close-ups, wide landscape shots, abstract conceptual imagery, dynamic movement). "
@@ -196,6 +238,7 @@ async def generate_teaser_short_plan(topic: str, long_title: str, long_url: str,
         "search_terms": terms
     }
 
+# === MOTOR KOKORO-82M EN ESPAÑOL NATIVO ===
 def format_ass_time(seconds: float) -> str:
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
@@ -224,6 +267,7 @@ async def generate_voice_kokoro(script_text: str, audio_path: str, is_short: boo
     else:
         raise RuntimeError("Kokoro-82M no devolvió audio.")
 
+# === DESCARGA VISUAL Y ENSAMBLAJE FFMPEG DE ALTA CALIDAD ===
 def is_valid_image(file_path: str) -> bool:
     if not os.path.exists(file_path) or os.path.getsize(file_path) < 5000:
         return False
@@ -234,7 +278,6 @@ def is_valid_image(file_path: str) -> bool:
 async def download_valid_image(client: httpx.AsyncClient, term: str, idx: int, img_file: str, w: int, h: int) -> bool:
     clean_term = re.sub(r"[^a-zA-Z0-9 ]", "", term).strip()
     ratio_str = "vertical 9:16 portrait" if h > w else "widescreen 16:9 cinematic"
-    # Semilla totalmente aleatoria con timestamp y número de índice para evitar que repita imágenes cacheadas
     unique_seed = np.random.randint(100, 999999)
     encoded = urllib.parse.quote(f"{clean_term}, {ratio_str}, ultra detailed, 8k resolution, photorealistic")
     
@@ -313,7 +356,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             clip_file = f"output/{prefix}_clip_{i}.mp4"
             got_clip = False
 
-            # Búsqueda en Pexels aleatorizando la página de resultados para que no siempre descargue el primer video de stock
             if PEXELS_API_KEY:
                 try:
                     page_rand = np.random.randint(1, 4)
@@ -321,7 +363,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     r = await client.get(pexels_url, headers={"Authorization": PEXELS_API_KEY})
                     videos = r.json().get("videos", [])
                     if videos:
-                        # Seleccionar un video aleatorio dentro de los resultados para garantizar variedad
                         chosen_vid = np.random.choice(videos)
                         vfiles = chosen_vid.get("video_files", [])
                         if vfiles:
@@ -345,10 +386,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 frames = int(clip_duration * 30)
                 if has_img:
                     scale_w, scale_h = int(w * 1.18), int(h * 1.18)
-                    # Efecto de zoom y paneo dinámico más cinematográfico y de alta calidad visual
                     subprocess.run([
                         "ffmpeg", "-y", "-loop", "1", "-t", str(clip_duration), "-i", img_file,
-                        "-vf", f"scale={scale_w}:{scale_h}:force_original_aspect_ratio=increase,crop={scale_w}:{scale_h},zoompan=z='min(zoom+0.0015,1.25)':x='iw/2-(iw/zoom/2)':y='ih/2-(iw/zoom/2)':d={frames}:s={w}x{h}:fps=30",
+                        "-vf", f"scale={scale_w}:{scale_h}:force_original_aspect_ratio=increase,crop={scale_w}:{scale_h},zoompan=z='min(zoom+0.0015,1.25)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps=30",
                         "-t", str(clip_duration), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "medium", "-crf", "20", clip_file
                     ], check=True)
                 else:
@@ -364,7 +404,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         for cp in clip_paths:
             f.write(f"file '{cp}'\n")
 
-    # Renderizado final optimizado con mayor tasa de compresión y calidad visual superior (crf 21)
     subprocess.run([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
         "-i", audio_path,
@@ -375,6 +414,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     return final_video
 
+# === SUBIDA A YOUTUBE CON ROTADOR DE CREDENCIALES ===
 def upload_youtube_rotated(video_path: str, title: str, description: str, tags: list[str], is_short: bool = True) -> str:
     token_files = sorted(glob.glob("tokens/token_*.json"))
     if not token_files:
@@ -399,6 +439,7 @@ def upload_youtube_rotated(video_path: str, title: str, description: str, tags: 
             raise e
     raise RuntimeError("Todos los tokens de YouTube agotaron su cuota.")
 
+# === ORQUESTADOR PRINCIPAL INTELIGENTE ===
 async def main():
     try:
         mode = "both"
@@ -409,35 +450,47 @@ async def main():
         elif MODE_CHOICE == "3":
             mode = "both"
 
-        voice_labels = {"1": "em_alex", "2": "ef_dora", "3": "em_santa"}
-        
         await send_telegram(
-            f"⚙️ Iniciando tanda de alta calidad:\n"
-            f"📌 Tema: {RAW_TOPIC}\n"
+            f"⚙️ Iniciando tanda de producción inteligente:\n"
+            f"📌 Nicho base: {RAW_TOPIC}\n"
             f"📦 Cantidad: {VIDEO_COUNT}\n"
             f"🎬 Modo: {mode.upper()}"
         )
 
-        subtopics = await generate_subtopics(RAW_TOPIC, VIDEO_COUNT)
+        # 1. Estudio previo de canales y estrategias exitosas
+        niche_analysis = await analyze_niche_competitors(RAW_TOPIC)
+        
+        await send_telegram(
+            f"💡 **Estudio de Competencia Completado:**\n"
+            f"🏆 **Estrategia detectada:** {niche_analysis['strategy']}\n"
+            f"🎯 **Tema optimizado:** {niche_analysis['topic']}"
+        )
+
+        # 2. Generar subtemas basados en el análisis optimizado
+        subtopics = await generate_subtopics(niche_analysis['topic'], VIDEO_COUNT)
 
         for idx, current_topic in enumerate(subtopics, start=1):
             prefix_tag = f"[{idx}/{VIDEO_COUNT}]"
             long_url = "https://youtube.com"
             long_title = current_topic
 
+            effective_topic = f"{current_topic}. Enfoque estratégico: {niche_analysis['hook']}" if idx == 1 and niche_analysis['hook'] else current_topic
+
+            # 3. VIDEO LARGO HORIZONTAL (16:9)
             if mode in ["both", "long"]:
-                await send_telegram(f"🎥 {prefix_tag} Generando documental largo sobre: '{current_topic}'...")
-                long_plan = await generate_long_plan(current_topic)
+                await send_telegram(f"🎥 {prefix_tag} Creando documental largo (16:9) aplicando estrategias de la competencia...")
+                long_plan = await generate_long_plan(effective_topic)
                 long_title = long_plan["title"]
 
                 long_video_path = await render_video(f"long_{idx}", long_plan["script"], long_plan["search_terms"], is_short=False)
                 long_url = upload_youtube_rotated(long_video_path, long_title, long_plan["description"], long_plan["tags"], is_short=False)
-                await send_telegram(f"✅ {prefix_tag} ¡Video Largo Publicado!\n🔗 {long_url}")
+                await send_telegram(f"✅ {prefix_tag} ¡Video Largo Publicado con éxito!\n📺 {long_title}\n🔗 {long_url}")
 
+            # 4. SHORT VERTICAL (9:16)
             if mode in ["both", "short"]:
                 is_standalone = (mode == "short")
-                await send_telegram(f"⚡ {prefix_tag} Generando Short sobre: '{current_topic}'...")
-                short_plan = await generate_teaser_short_plan(current_topic, long_title, long_url, is_standalone=is_standalone)
+                await send_telegram(f"⚡ {prefix_tag} Creando Short optimizado con gatillos mentales de retención...")
+                short_plan = await generate_teaser_short_plan(effective_topic, long_title, long_url, is_standalone=is_standalone)
 
                 short_video_path = await render_video(
                     f"short_{idx}",
@@ -447,9 +500,9 @@ async def main():
                     cta_banner=(mode == "both")
                 )
                 short_url = upload_youtube_rotated(short_video_path, short_plan["title"], short_plan["description"], short_plan["tags"], is_short=True)
-                await send_telegram(f"🔥 {prefix_tag} ¡Short Publicado!\n🔗 {short_url}")
+                await send_telegram(f"🔥 {prefix_tag} ¡Short Lanzador Publicado!\n🔗 {short_url}")
 
-        await send_telegram(f"🏁 ¡Tanda completada con éxito!")
+        await send_telegram(f"🏁 ¡Tanda de {VIDEO_COUNT} producción(es) completada con éxito!")
 
     except Exception as e:
         await send_telegram(f"❌ Error en la fábrica: {str(e)}")
