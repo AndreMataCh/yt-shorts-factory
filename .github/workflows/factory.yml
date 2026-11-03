@@ -3,19 +3,25 @@ name: YouTube Shorts Factory
 on:
   repository_dispatch:
     types: [create_short]
-  workflow_dispatch: # Permite probarlo con un botón manual desde GitHub
+  workflow_dispatch:
 
 jobs:
   produce-and-upload:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Descargar código
         uses: actions/checkout@v4
 
-      - name: Instalar FFmpeg, eSpeak y Kokoro
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar FFmpeg, eSpeak y dependencias de Kokoro
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg fonts-liberation espeak-ng
-          pip install httpx kokoro soundfile google-api-python-client google-auth-oauthlib google-auth-httplib2
+          pip install --upgrade pip
+          pip install httpx kokoro soundfile numpy google-api-python-client google-auth-oauthlib google-auth-httplib2
 
       - name: Cargar Tokens de YouTube desde Secrets
         env:
@@ -23,13 +29,18 @@ jobs:
           YT_TOKEN_2: ${{ secrets.YT_TOKEN_2 }}
         run: |
           mkdir -p tokens output
-          echo "$YT_TOKEN_1" > tokens/token_1.json
+          if [ -n "$YT_TOKEN_1" ]; then echo "$YT_TOKEN_1" > tokens/token_1.json; fi
           if [ -n "$YT_TOKEN_2" ]; then echo "$YT_TOKEN_2" > tokens/token_2.json; fi
 
       - name: Ejecutar Fábrica
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           TOPIC: ${{ github.event.client_payload.topic || 'Las 3 paradojas más extrañas del tiempo' }}
-          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          VOICE_STYLE: ${{ github.event.client_payload.voice_style || '1' }}
+          VIDEO_COUNT: ${{ github.event.client_payload.video_count || '1' }}
+          MODE: ${{ github.event.client_payload.mode || '3' }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id || secrets.TELEGRAM_CHAT_ID }}
         run: python run_job.py
