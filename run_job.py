@@ -34,7 +34,7 @@ BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 }
 
-ACTIVE_GROQ_MODEL = None
+CACHED_GROQ_MODELS = []
 
 print("Inicializando motor neuronal Kokoro-82M (Español 'e')...")
 kokoro_pipeline = KPipeline(lang_code='e')
@@ -50,98 +50,132 @@ async def send_telegram(text: str):
         except Exception as e:
             print(f"Aviso Telegram: {e}")
 
-# === MOTOR LLM CON AUTO-DETECCIÓN Y FALLBACK ROBUSTO ===
-async def get_working_groq_model(client: httpx.AsyncClient, headers: dict) -> str:
-    global ACTIVE_GROQ_MODEL
-    if ACTIVE_GROQ_MODEL:
-        return ACTIVE_GROQ_MODEL
+# === MOTOR LLM CON ROTACIÓN ANTI-429 EN GROQ Y FALLBACK ROBUSTO ===
+async def get_ranked_groq_models(client: httpx.AsyncClient, headers: dict) -> list[str]:
+    global CACHED_GROQ_MODELS
+    if CACHED_GROQ_MODELS:
+        return CACHED_GROQ_MODELS
+
     res = await client.get("https://api.groq.com/openai/v1/models", headers=headers)
     if res.status_code != 200:
         raise RuntimeError(f"Error Groq Models ({res.status_code}): {res.text}")
+
     all_models = [m["id"] for m in res.json().get("data", [])]
     chat_models = [
         m for m in all_models
-        if not any(x in m.lower() for x in ["whisper", "guard", "tts", "playai", "vision", "embed", "orpheus"])
+        if not any(x in m.lower() for x in ["whisper", "guard", "tts", "playai", "vision", "embed", "orpheus", "allam"])
     ]
-    for keyword in ["70b", "llama-4", "qwen", "deepseek", "llama-3", "llama3", "gemma", "8b"]:
-        for m in chat_models:
-            if keyword in m.lower():
-                ACTIVE_GROQ_MODEL = m
-                return ACTIVE_GROQ_MODEL
-    ACTIVE_GROQ_MODEL = chat_models[0]
-    return ACTIVE_GROQ_MODEL
 
-async def ask_llm(prompt: str, max_tokens: int = 1800) -> str:
+    # Priorizar modelos Llama y Gemma (alto límite de tokens/minuto, sin gasto excesivo de <think>)
+    priority_keywords = [
+        "llama-3.3-70b",
+        "llama-3.1-8b",
+        "llama3-70b",
+        "llama3-8b",
+        "llama-4",
+        "gemma2",
+        "mixtral",
+        "qwen",
+        "deepseek"
+    ]
+
+    ranked = []
+    for kw in priority_keywords:
+        for m in chat_models:
+            if kw in m.lower() and m not in ranked:
+                ranked.append(m)
+
+    for m in chat_models:
+        if m not in ranked:
+            ranked.append(m)
+
+    CACHED_GROQ_MODELS = ranked
+    return CACHED_GROQ_MODELS
+
+async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
     errors = []
-    
-    # 1. Intentar con Groq API
+
+    # 1. Intentar con Groq API rotando modelos automáticamente si hay Rate Limit (429)
     if GROQ_API_KEY:
         headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         async with httpx.AsyncClient(timeout=60.0) as client:
             try:
-                model_name = await get_working_groq_model(client, headers)
-                res = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers,
-                    json={
-                        "model": model_name,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.75,
-                        "max_tokens": max_tokens
-                    }
-                )
-                if res.status_code == 200:
-                    content = res.json()["choices"][0]["message"]["content"]
-                    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-                else:
-                    errors.append(f"Groq Error {res.status_code}: {res.text}")
+                models_to_try = await get_ranked_groq_models(client, headers)
+                for model_name in models_to_try[:5]:
+                    res = await client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers=headers,
+                        json={
+                            "model": model_name,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.7,
+                            "max_tokens": max_tokens
+                        }
+                    )
+                    if res.status_code == 200:
+                        content = res.json()["choices"][0]["message"]["content"]
+                        cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                        if cleaned:
+                            return cleaned
+                    elif res.status_code == 429:
+                        print(f"Rate limit (429) en {model_name}, esperando 4s y rotando al siguiente modelo...")
+                        errors.append(f"Groq 429 ({model_name})")
+                        await asyncio.sleep(4)
+                        continue
+                    else:
+                        errors.append(f"Groq {res.status_code} ({model_name})")
             except Exception as e:
                 errors.append(f"Groq Exception: {e}")
     else:
-        errors.append("Groq API Key no configurada en Secrets.")
+        errors.append("Groq API Key vacía")
 
-    # 2. Intentar con Gemini API (usando gemini-1.5-flash, altamente estable)
+    # 2. Intentar con Gemini API (si está configurada)
     if GEMINI_API_KEY:
         async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS) as client:
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-                res = await client.post(url, json={"contents": [{"parts": [{"text": prompt}]}]})
-                if res.status_code == 200:
-                    content = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-                    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-                else:
-                    errors.append(f"Gemini Error {res.status_code}: {res.text}")
-            except Exception as e:
-                errors.append(f"Gemini Exception: {e}")
-    else:
-        errors.append("Gemini API Key no configurada en Secrets.")
+            for gemini_model in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={GEMINI_API_KEY}"
+                    res = await client.post(url, json={"contents": [{"parts": [{"text": prompt}]}]})
+                    if res.status_code == 200:
+                        content = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                        return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                    else:
+                        errors.append(f"Gemini ({gemini_model}) {res.status_code}")
+                except Exception as e:
+                    errors.append(f"Gemini Exception: {e}")
 
-    # 3. Respaldo Pollinations
+    # 3. Respaldo Pollinations (forzando modelos directos sin razonamiento pesado)
     async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS) as client:
-        try:
-            res = await client.post(
-                "https://text.pollinations.ai/",
-                json={"messages": [{"role": "user", "content": prompt}], "seed": np.random.randint(1000, 99999)}
-            )
-            if res.status_code == 200:
-                if "application/json" in res.headers.get("content-type", ""):
-                    content = res.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        for poll_model in ["mistral", "openai-fast", "openai"]:
+            try:
+                res = await client.post(
+                    "https://text.pollinations.ai/",
+                    json={
+                        "model": poll_model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "seed": np.random.randint(1000, 99999)
+                    }
+                )
+                if res.status_code == 200:
+                    if "application/json" in res.headers.get("content-type", ""):
+                        content = res.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+                    else:
+                        content = res.text
+                    cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                    if cleaned:
+                        return cleaned
                 else:
-                    content = res.text
-                if content.strip():
-                    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-            else:
-                errors.append(f"Pollinations Error {res.status_code}: {res.text}")
-        except Exception as e:
-            errors.append(f"Pollinations Exception: {e}")
+                    errors.append(f"Pollinations ({poll_model}) {res.status_code}")
+            except Exception as e:
+                errors.append(f"Pollinations ({poll_model}) Exception: {e}")
 
-    # Si todo falla, enviará el motivo exacto por Telegram y a la consola
     detailed_error = " | ".join(errors)
     raise RuntimeError(f"Falla total de LLMs. Detalles: {detailed_error}")
+
 # === ESTUDIO DE COMPETENCIA Y MODELADO DE ESTRATEGIAS VIRALES ===
 async def analyze_niche_competitors(main_topic: str) -> dict:
     await send_telegram(f"🔍 Analizando canales exitosos y patrones virales en el nicho: '{main_topic}'...")
-    
+
     prompt = (
         f"Actúa como un estratega experto en crecimiento de YouTube y analista de datos de contenidos virales. "
         f"Para el nicho o tema general: '{main_topic}':\n"
@@ -152,13 +186,13 @@ async def analyze_niche_competitors(main_topic: str) -> dict:
         f"TEMA_OPTIMIZADO: [El título o enfoque exacto perfeccionado para el video]\n"
         f"GANCHO: [La frase exacta con la que debe iniciar el guion para atrapar al usuario en 3 segundos]"
     )
-    
-    response = await ask_llm(prompt, max_tokens=1000)
-    
+
+    response = await ask_llm(prompt, max_tokens=600)
+
     estrategia = "Patrones de alta retención estándar"
     tema_optimizado = main_topic
     gancho = ""
-    
+
     for line in response.splitlines():
         if line.startswith("ESTRATEGIA:"):
             estrategia = line.replace("ESTRATEGIA:", "").strip()
@@ -166,7 +200,7 @@ async def analyze_niche_competitors(main_topic: str) -> dict:
             tema_optimizado = line.replace("TEMA_OPTIMIZADO:", "").strip()
         elif line.startswith("GANCHO:"):
             gancho = line.replace("GANCHO:", "").strip()
-            
+
     if not tema_optimizado:
         tema_optimizado = main_topic
 
@@ -183,7 +217,7 @@ async def generate_subtopics(main_topic: str, count: int) -> list[str]:
         f"Genera exactamente {count} ángulos, enfoques o subtemas totalmente distintos y creativos basados en: '{main_topic}'. "
         f"Evita repetir conceptos. Devuelve ÚNICAMENTE una lista de {count} líneas (un subtema por línea), sin numeración ni texto extra."
     )
-    raw = await ask_llm(prompt, max_tokens=600)
+    raw = await ask_llm(prompt, max_tokens=500)
     lines = [re.sub(r"^[\d\-\.\*\)]+\s*", "", line).strip() for line in raw.splitlines() if line.strip()]
     subtopics = lines[:count]
     while len(subtopics) < count:
@@ -197,13 +231,14 @@ async def generate_long_plan(topic: str) -> dict:
         "Estructura: Gancho inicial impactante, desarrollo con datos sorprendentes y conclusión reflexiva. "
         "REGLAS ESTRICTAS: Devuelve ÚNICAMENTE el texto que dirá el narrador. Sin títulos, sin asteriscos, sin emojis."
     )
-    script = re.sub(r"[\*\#\[\]\(\)]", "", await ask_llm(script_prompt, max_tokens=2200)).strip()
-    title = (await ask_llm(f"Crea un título magnético de YouTube (máx 65 caracteres) en español para un documental sobre '{topic}'. SOLO el título sin comillas.")).replace('"', '').splitlines()[0].strip()[:75]
+    script = re.sub(r"[\*\#\[\]\(\)]", "", await ask_llm(script_prompt, max_tokens=1200)).strip()
+    title = (await ask_llm(f"Crea un título magnético de YouTube (máx 65 caracteres) en español para un documental sobre '{topic}'. SOLO el título sin comillas.", max_tokens=120)).replace('"', '').splitlines()[0].strip()[:75]
 
     terms_raw = await ask_llm(
         f"For the documentary topic '{topic}', provide exactly 8 completely unique and highly specific visual search terms in English. "
         "Make them diverse (include cinematic close-ups, wide landscape shots, abstract conceptual imagery, dynamic movement). "
-        "Return ONLY the 8 comma-separated terms."
+        "Return ONLY the 8 comma-separated terms.",
+        max_tokens=200
     )
     terms = [t.strip() for t in terms_raw.split(",") if t.strip()][:8]
     while len(terms) < 8:
@@ -231,11 +266,12 @@ async def generate_teaser_short_plan(topic: str, long_title: str, long_url: str,
             "REGLAS: Devuelve ÚNICAMENTE el texto hablado en español neutro, sin asteriscos ni emojis."
         )
 
-    script = re.sub(r"[\*\#\[\]\(\)]", "", await ask_llm(script_prompt, max_tokens=800)).strip()
-    title = (await ask_llm(f"Crea un título corto y misterioso (máx 55 caracteres) para un Short sobre '{topic}'. SOLO el título sin comillas.")).replace('"', '').splitlines()[0].strip()[:65]
+    script = re.sub(r"[\*\#\[\]\(\)]", "", await ask_llm(script_prompt, max_tokens=500)).strip()
+    title = (await ask_llm(f"Crea un título corto y misterioso (máx 55 caracteres) para un Short sobre '{topic}'. SOLO el título sin comillas.", max_tokens=120)).replace('"', '').splitlines()[0].strip()[:65]
 
     terms_raw = await ask_llm(
-        f"Provide 5 distinct, high-impact cinematic visual search terms in English about '{topic}'. Make them varied and unique. Return ONLY the 5 comma-separated terms."
+        f"Provide 5 distinct, high-impact cinematic visual search terms in English about '{topic}'. Make them varied and unique. Return ONLY the 5 comma-separated terms.",
+        max_tokens=150
     )
     terms = [t.strip() for t in terms_raw.split(",") if t.strip()][:5]
     while len(terms) < 5:
@@ -270,7 +306,7 @@ async def generate_voice_kokoro(script_text: str, audio_path: str, is_short: boo
     voice_map = {"1": "em_alex", "2": "ef_dora", "3": "em_santa"}
     voice_name = voice_map.get(VOICE_STYLE, "em_alex")
     speed_val = 1.08 if is_short else 1.02
-    
+
     generator = kokoro_pipeline(script_text, voice=voice_name, speed=speed_val)
     audio_chunks = [chunk for _, _, chunk in generator]
 
@@ -293,7 +329,7 @@ async def download_valid_image(client: httpx.AsyncClient, term: str, idx: int, i
     ratio_str = "vertical 9:16 portrait" if h > w else "widescreen 16:9 cinematic"
     unique_seed = np.random.randint(100, 999999)
     encoded = urllib.parse.quote(f"{clean_term}, {ratio_str}, ultra detailed, 8k resolution, photorealistic")
-    
+
     urls = [
         f"https://image.pollinations.ai/prompt/{encoded}?width={w}&height={h}&nologo=true&model=flux&seed={unique_seed}",
         f"https://picsum.photos/seed/{unique_seed}/{w}/{h}"
@@ -472,11 +508,11 @@ async def main():
 
         # 1. Estudio previo de canales y estrategias exitosas
         niche_analysis = await analyze_niche_competitors(RAW_TOPIC)
-        
+
         await send_telegram(
-            f"💡 **Estudio de Competencia Completado:**\n"
-            f"🏆 **Estrategia detectada:** {niche_analysis['strategy']}\n"
-            f"🎯 **Tema optimizado:** {niche_analysis['topic']}"
+            f"💡 Estudio de Competencia Completado:\n"
+            f"🏆 Estrategia detectada: {niche_analysis['strategy']}\n"
+            f"🎯 Tema optimizado: {niche_analysis['topic']}"
         )
 
         # 2. Generar subtemas basados en el análisis optimizado
