@@ -65,7 +65,6 @@ print("Inicializando motor neuronal Kokoro-82M...")
 kokoro_pipeline = KPipeline(lang_code='e')
 
 def run_ffmpeg(cmd: list[str], step_desc: str = "FFmpeg"):
-    """Ejecuta FFmpeg capturando stderr para mostrar la causa exacta si algo falla."""
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if res.returncode != 0:
         err_msg = res.stderr.decode("utf-8", errors="ignore")
@@ -95,7 +94,6 @@ def clean_llm_output(text: str) -> str:
 async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
     errors = []
 
-    # 1. GOOGLE GEMINI CON AUTO-DESCUBRIMIENTO DE MODELOS ACTIVOS
     if GEMINI_API_KEY and GEMINI_API_KEY.startswith("AIza"):
         gemini_headers = {**BROWSER_HEADERS, "x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
         async with httpx.AsyncClient(timeout=60.0, headers=gemini_headers) as client:
@@ -133,7 +131,6 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                 except Exception as e:
                     errors.append(f"Gemini ({model}): {str(e)[:60]}")
 
-    # 2. GROQ CON AUTO-DESCUBRIMIENTO DE MODELOS ACTIVOS
     if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
         groq_headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         async with httpx.AsyncClient(timeout=60.0, headers=groq_headers) as client:
@@ -167,7 +164,6 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                 except Exception as e:
                     errors.append(f"Groq ({model}): {str(e)[:60]}")
 
-    # 3. RESPALDO GRATUITO: POLLINATIONS OPENAI ENDPOINT (/openai)
     async with httpx.AsyncClient(timeout=60.0, headers={**BROWSER_HEADERS, "Content-Type": "application/json"}, follow_redirects=True) as client:
         for poly_model in ["openai", "mistral", "llama"]:
             try:
@@ -261,7 +257,6 @@ async def generate_teaser_short_plan(topic: str, long_title: str = "", long_url:
     }
 
 def format_ass_time(seconds: float) -> str:
-    """Convierte segundos a formato H:MM:SS.CC con acarreo exacto para evitar segundos = 60."""
     total_cs = int(round(max(0.0, float(seconds)) * 100))
     h = total_cs // 360000
     m = (total_cs % 360000) // 6000
@@ -368,46 +363,26 @@ def get_channel_subtitle_profile(channel_name: str, topic: str) -> dict:
     text_sig = (channel_name + " " + topic).lower()
     if any(k in text_sig for k in ['finan', 'cripto', 'dinero', 'banco', 'invers', 'negocio', 'bitcoin']):
         return {
-            "primary_style": "&H0000D7FF",
-            "active_style": "&H0000FF7F",
-            "outline_style": "&H00000000",
-            "primary_tag": "&H00D7FF&",
-            "active_tag": "&H00FF7F&",
-            "font_name": "DejaVu Sans",
-            "font_size_short": 82,
-            "font_size_long": 58
+            "primary_style": "&H0000D7FF", "active_style": "&H0000FF7F", "outline_style": "&H00000000",
+            "primary_tag": "&H00D7FF&", "active_tag": "&H00FF7F&", "font_name": "DejaVu Sans",
+            "font_size_short": 82, "font_size_long": 58
         }
     elif any(k in text_sig for k in ['terror', 'misteri', 'oscuro', 'crimen', 'miedo', 'secreto', 'paranormal', 'interrogatorio']):
         return {
-            "primary_style": "&H00FFFFFF",
-            "active_style": "&H000000FF",
-            "outline_style": "&H00000000",
-            "primary_tag": "&HFFFFFF&",
-            "active_tag": "&H0000FF&",
-            "font_name": "DejaVu Sans",
-            "font_size_short": 84,
-            "font_size_long": 60
+            "primary_style": "&H00FFFFFF", "active_style": "&H000000FF", "outline_style": "&H00000000",
+            "primary_tag": "&HFFFFFF&", "active_tag": "&H0000FF&", "font_name": "DejaVu Sans",
+            "font_size_short": 84, "font_size_long": 60
         }
     elif any(k in text_sig for k in ['tech', 'tecno', 'ia', 'futuro', 'ciencia', 'codigo', 'robot']):
         return {
-            "primary_style": "&H00FFFFFF",
-            "active_style": "&H00FFFF00",
-            "outline_style": "&H00111111",
-            "primary_tag": "&HFFFFFF&",
-            "active_tag": "&HFFFF00&",
-            "font_name": "DejaVu Sans",
-            "font_size_short": 80,
-            "font_size_long": 56
+            "primary_style": "&H00FFFFFF", "active_style": "&H00FFFF00", "outline_style": "&H00111111",
+            "primary_tag": "&HFFFFFF&", "active_tag": "&HFFFF00&", "font_name": "DejaVu Sans",
+            "font_size_short": 80, "font_size_long": 56
         }
     return {
-        "primary_style": "&H00FFFFFF",
-        "active_style": "&H0000FFFF",
-        "outline_style": "&H00000000",
-        "primary_tag": "&HFFFFFF&",
-        "active_tag": "&H00FFFF&",
-        "font_name": "DejaVu Sans",
-        "font_size_short": 82,
-        "font_size_long": 58
+        "primary_style": "&H00FFFFFF", "active_style": "&H0000FFFF", "outline_style": "&H00000000",
+        "primary_tag": "&HFFFFFF&", "active_tag": "&H00FFFF&", "font_name": "DejaVu Sans",
+        "font_size_short": 82, "font_size_long": 58
     }
 
 def sanitize_ass_word(word: str) -> str:
@@ -535,15 +510,12 @@ async def render_video_with_real_clips(prefix: str, script_text: str, search_ter
     raw_output = f"output/{prefix}_raw.mp4"
     final_video = f"output/{prefix}_final.mp4"
 
-    # 1. Voz Kokoro pre-limpiada
     await generate_voice_kokoro(script_text, voice_path, is_short=is_short)
     total_duration = max(1.0, get_audio_duration(voice_path))
 
-    # 2. Subtítulos .ASS con Pop y color adaptativo al canal
     words_timed = await get_word_timestamps(voice_path, script_text, total_duration)
     build_viral_ass_subtitles(words_timed, ass_path, w, h, is_short, total_duration, CHANNEL_NAME, RAW_TOPIC)
 
-    # 3. Mezcla de voz + BGM en formato PCM WAV nativo (Evita el error exit status 234)
     await prepare_background_music(total_duration, bgm_path)
     fade_start = max(0.0, total_duration - 2.0)
 
@@ -554,7 +526,6 @@ async def render_video_with_real_clips(prefix: str, script_text: str, search_ter
         "-map", "[aout]", "-c:a", "pcm_s16le", "-ar", "24000", "-ac", "1", mixed_audio
     ], "Mezcla Master WAV")
 
-    # 4. Descarga y normalización estricta de clips B-Roll
     target_cut_sec = 2.8 if is_short else 3.8
     num_cuts = max(int(np.ceil(total_duration / target_cut_sec)), len(search_terms), 4)
     clip_duration = total_duration / num_cuts
@@ -609,7 +580,6 @@ async def render_video_with_real_clips(prefix: str, script_text: str, search_ter
         for cp in clip_paths:
             f.write(f"file '{cp}'\n")
 
-    # 5. Renderizado de concatenación + quemado de subtítulos .ASS
     ass_filter_path = ass_path.replace("\\", "/").replace(":", "\\:")
     run_ffmpeg([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
@@ -656,7 +626,7 @@ def upload_youtube_rotated(video_path: str, title: str, description: str, tags: 
 
 async def main():
     try:
-        await send_telegram(f"🚀 <b>Iniciando Fábrica Pro v4.0 (SEO Curado + Subtítulos Pop)</b>\n📺 <b>Canal:</b> {CHANNEL_NAME}\n📌 <b>Tema:</b> {RAW_TOPIC}")
+        await send_telegram(f"🚀 <b>Iniciando Fábrica Pro v4.0 (Cantidad: {VIDEO_COUNT})</b>\n📺 <b>Canal:</b> {CHANNEL_NAME}\n📌 <b>Tema:</b> {RAW_TOPIC}")
 
         if SOURCE_VIDEO_URL:
             is_short_mode = (MODE_CHOICE == "1")
@@ -667,25 +637,39 @@ async def main():
             await send_telegram(f"✅ <b>Video Pregrabado Masterizado y Publicado:</b>\n🔗 {vid_url}")
             return
 
-        subtopics = [RAW_TOPIC]
+        # Generación de subtemas múltiples basados en la cantidad elegida (1, 3 o 5)
+        if VIDEO_COUNT > 1:
+            variation_prompt = (
+                f"Para el nicho principal '{RAW_TOPIC}', genera exactamente {VIDEO_COUNT} subtemas virales y diferentes "
+                f"para videos de YouTube. Devuelve ÚNICAMENTE los {VIDEO_COUNT} títulos separados por punto y coma (;), sin numeración ni texto extra."
+            )
+            raw_subtopics = await ask_llm(variation_prompt, max_tokens=300)
+            subtopics = [s.strip() for s in raw_subtopics.split(";") if s.strip()][:VIDEO_COUNT]
+            while len(subtopics) < VIDEO_COUNT:
+                subtopics.append(f"{RAW_TOPIC} - Parte {len(subtopics)+1}")
+        else:
+            subtopics = [RAW_TOPIC]
+
         for idx, topic in enumerate(subtopics, start=1):
             long_url = ""
             long_title = topic
+
+            await send_telegram(f"📌 <b>Procesando video {idx} de {len(subtopics)}</b>\nTema: {topic}")
 
             if MODE_CHOICE in ["2", "3"]:
                 long_plan = await generate_long_plan(topic)
                 long_title = long_plan["title"]
                 long_vid = await render_video_with_real_clips(f"long_{idx}", long_plan["script"], long_plan["search_terms"], is_short=False)
                 long_url = upload_youtube_rotated(long_vid, long_plan["title"], long_plan["description"], long_plan["tags"], is_short=False)
-                await send_telegram(f"✅ <b>Video Largo Publicado en {CHANNEL_NAME}:</b>\n📺 {long_plan['title']}\n🔗 {long_url}")
+                await send_telegram(f"✅ <b>Video Largo ({idx}/{len(subtopics)}) Publicado:</b>\n📺 {long_plan['title']}\n🔗 {long_url}")
 
             if MODE_CHOICE in ["1", "3"]:
                 short_plan = await generate_teaser_short_plan(topic, long_title, long_url)
                 short_vid = await render_video_with_real_clips(f"short_{idx}", short_plan["script"], short_plan["search_terms"], is_short=True)
                 short_url = upload_youtube_rotated(short_vid, short_plan["title"], short_plan["description"], short_plan["tags"], is_short=True)
-                await send_telegram(f"🔥 <b>Short Dinámico Publicado en {CHANNEL_NAME}:</b>\n🔗 {short_url}")
+                await send_telegram(f"🔥 <b>Short Dinámico ({idx}/{len(subtopics)}) Publicado:</b>\n🔗 {short_url}")
 
-        await send_telegram(f"🏁 <b>¡Tanda finalizada con éxito en {CHANNEL_NAME}!</b>")
+        await send_telegram(f"🏁 <b>¡Tanda de {len(subtopics)} videos finalizada con éxito en {CHANNEL_NAME}!</b>")
     except Exception as e:
         await send_telegram(f"❌ <b>Error crítico en fábrica ({CHANNEL_NAME}):</b>\n<code>{str(e)}</code>")
         raise e
