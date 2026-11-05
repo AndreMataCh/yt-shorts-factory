@@ -17,7 +17,6 @@ from googleapiclient.errors import HttpError
 def clean_secret(val: str) -> str:
     if not val:
         return ""
-    # Elimina comillas, saltos de línea y espacios accidentales al copiar/pegar en GitHub Secrets
     return re.sub(r'[\r\n\t"\'\s]+', '', val)
 
 # === VARIABLES DE ENTORNO Y PAYLOAD DE PAULA / WORKER ===
@@ -94,7 +93,7 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
             "Content-Type": "application/json"
         }
         async with httpx.AsyncClient(timeout=60.0, headers=gemini_headers) as client:
-            models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest", "gemini-pro-latest"]
+            models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
             try:
                 list_res = await client.get("https://generativelanguage.googleapis.com/v1beta/models")
                 if list_res.status_code == 200:
@@ -106,10 +105,9 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                         and "vision" not in m.get("name", "")
                         and "embedding" not in m.get("name", "")
                     ]
-                    # Priorizar modelos flash disponibles en la cuenta
-                    flash_First = sorted(avail, key=lambda x: (0 if "flash" in x else 1))
-                    if flash_First:
-                        models_to_try = flash_First[:4]
+                    flash_first = sorted(avail, key=lambda x: (0 if "flash" in x else 1))
+                    if flash_first:
+                        models_to_try = flash_first[:4]
             except Exception:
                 pass
 
@@ -129,7 +127,7 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                 except Exception as e:
                     errors.append(f"Gemini ({model}): {str(e)[:60]}")
     elif GEMINI_API_KEY:
-        errors.append("GEMINI_API_KEY inválida (no inicia con AIza)")
+        errors.append("GEMINI_API_KEY inválida")
 
     # 2. GROQ CON AUTO-DESCUBRIMIENTO DE MODELOS ACTIVOS
     if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
@@ -148,7 +146,6 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                         if "whisper" not in m["id"].lower() and "guard" not in m["id"].lower() and "tts" not in m["id"].lower()
                     ]
                     if avail_g:
-                        # Priorizar llama-3.3 o llama-3.1 si existen
                         avail_g.sort(key=lambda x: (0 if "llama-3.3" in x else (1 if "llama" in x else 2)))
                         groq_models = avail_g[:4]
             except Exception:
@@ -175,7 +172,7 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                 except Exception as e:
                     errors.append(f"Groq ({model}): {str(e)[:60]}")
     elif GROQ_API_KEY:
-        errors.append("GROQ_API_KEY inválida (no inicia con gsk_)")
+        errors.append("GROQ_API_KEY inválida")
 
     # 3. RESPALDO GRATUITO OFICIAL 1: POLLINATIONS OPENAI ENDPOINT (/openai)
     async with httpx.AsyncClient(timeout=60.0, headers={**BROWSER_HEADERS, "Content-Type": "application/json"}, follow_redirects=True) as client:
@@ -231,18 +228,18 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
 async def generate_long_plan(topic: str) -> dict:
     script_prompt = (
         f"Escribe un guion documental fascinante y dinámico en español neutro de unas 350 a 450 palabras sobre: '{topic}'. "
-        "Estructura: Gancho impactante al inicio, desarrollo con alto ritmo narrativo y conclusión memorable. "
+        "Estructura: Gancho impactante en los primeros 3 segundos, desarrollo con alto ritmo narrativo y conclusión memorable. "
         "REGLAS: Devuelve ÚNICAMENTE el texto hablado. Sin asteriscos, sin títulos, sin emojis."
     )
     script = re.sub(r"[\*\#\[\]\(\)]", "", await ask_llm(script_prompt, max_tokens=1400)).strip()
     title = CUSTOM_TITLE or (await ask_llm(f"Crea un título magnético de YouTube (máx 65 caracteres) sobre '{topic}'. SOLO el título sin comillas.", max_tokens=150)).replace('"', '').splitlines()[0].strip()[:75]
 
     terms_raw = await ask_llm(
-        f"For the topic '{topic}', provide exactly 10 distinct, dynamic cinematic video search keywords in English. Return ONLY the 10 comma-separated terms.",
+        f"For the topic '{topic}', provide exactly 14 distinct, dynamic cinematic video search keywords in English (2 to 4 words each). Return ONLY the 14 comma-separated terms.",
         max_tokens=300
     )
-    terms = [t.strip() for t in terms_raw.split(",") if t.strip()][:10]
-    while len(terms) < 10:
+    terms = [t.strip() for t in terms_raw.split(",") if t.strip()][:14]
+    while len(terms) < 14:
         terms.append("cinematic abstract motion background")
 
     monetization_block = f"\n\n🔥 Recursos y enlaces exclusivos: {MONETIZATION_URL}" if MONETIZATION_URL else ""
@@ -267,11 +264,11 @@ async def generate_teaser_short_plan(topic: str, long_title: str = "", long_url:
     title = (await ask_llm(f"Crea un título corto y viral (máx 55 caracteres) para un Short sobre '{topic}'. SOLO el título sin comillas.", max_tokens=150)).replace('"', '').splitlines()[0].strip()[:65]
 
     terms_raw = await ask_llm(
-        f"Provide 6 high-speed dynamic video search keywords in English about '{topic}'. Return ONLY the 6 comma-separated terms.",
-        max_tokens=200
+        f"Provide 10 high-speed dynamic video search keywords in English about '{topic}' (2 to 4 words each). Return ONLY the 10 comma-separated terms.",
+        max_tokens=250
     )
-    terms = [t.strip() for t in terms_raw.split(",") if t.strip()][:6]
-    while len(terms) < 6:
+    terms = [t.strip() for t in terms_raw.split(",") if t.strip()][:10]
+    while len(terms) < 10:
         terms.append("fast paced abstract motion")
 
     desc_link = f"\n\n🔗 Video completo: {long_url}" if long_url else ""
@@ -285,10 +282,14 @@ async def generate_teaser_short_plan(topic: str, long_title: str = "", long_url:
     }
 
 def format_ass_time(seconds: float) -> str:
+    seconds = max(0.0, seconds)
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
-    cs = int((seconds % 1) * 100)
+    cs = int(round((seconds % 1) * 100))
+    if cs >= 100:
+        s += 1
+        cs = 0
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 def get_audio_duration(audio_path: str) -> float:
@@ -301,16 +302,160 @@ def get_audio_duration(audio_path: str) -> float:
 async def generate_voice_kokoro(script_text: str, audio_path: str, is_short: bool = True):
     voice_map = {"1": "em_alex", "2": "ef_dora", "3": "em_santa"}
     voice_name = voice_map.get(VOICE_STYLE, "em_alex")
-    speed_val = 1.10 if is_short else 1.03
+    speed_val = 1.12 if is_short else 1.04
 
     generator = kokoro_pipeline(script_text, voice=voice_name, speed=speed_val)
     audio_chunks = [chunk for _, _, chunk in generator]
 
-    if audio_chunks:
-        complete_audio = np.concatenate(audio_chunks)
-        sf.write(audio_path, complete_audio, 24000)
-    else:
+    if not audio_chunks:
         raise RuntimeError("Kokoro no generó audio.")
+
+    raw_voice = f"{audio_path}_raw.wav"
+    complete_audio = np.concatenate(audio_chunks)
+    sf.write(raw_voice, complete_audio, 24000)
+
+    # Pre-limpieza de silencios muertos ANTES de alinear subtítulos y cortar B-Roll
+    filtro_voz = (
+        "silenceremove=start_periods=1:start_silence=0.05:start_threshold=-48dB:"
+        "stop_periods=-1:stop_duration=0.22:stop_threshold=-48dB,"
+        "equalizer=f=180:t=q:w=1:g=2,equalizer=f=3200:t=q:w=1:g=3,"
+        "acompressor=threshold=-16dB:ratio=3:attack=5:release=50"
+    )
+    subprocess.run([
+        "ffmpeg", "-y", "-i", raw_voice,
+        "-af", filtro_voz,
+        "-c:a", "pcm_s16le", "-ar", "24000", audio_path
+    ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+async def get_word_timestamps(audio_path: str, script_text: str, total_duration: float) -> list[dict]:
+    """
+    Obtiene timestamps exactos al milisegundo palabra por palabra:
+    1. Vía Groq Whisper Large v3 Turbo (Word-Level Alignment en ~0.5s).
+    2. Fallback inteligente ponderado por sílabas y puntuación si no hay GROQ_API_KEY.
+    """
+    if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
+        try:
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                with open(audio_path, "rb") as f:
+                    files = {"file": ("voice.wav", f, "audio/wav")}
+                    data = {
+                        "model": "whisper-large-v3-turbo",
+                        "response_format": "verbose_json",
+                        "timestamp_granularities[]": "word",
+                        "language": "es"
+                    }
+                    res = await client.post(
+                        "https://api.groq.com/openai/v1/audio/transcriptions",
+                        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                        files=files,
+                        data=data
+                    )
+                if res.status_code == 200:
+                    words_data = res.json().get("words", [])
+                    aligned = []
+                    for w in words_data:
+                        txt = (w.get("word") or "").strip()
+                        if txt:
+                            aligned.append({
+                                "word": txt,
+                                "start": float(w.get("start", 0.0)),
+                                "end": float(w.get("end", 0.0))
+                            })
+                    if len(aligned) >= 3:
+                        print(f"Alineación fonética exacta completada vía Whisper ({len(aligned)} palabras).")
+                        return aligned
+        except Exception as e:
+            print(f"Aviso Whisper Alignment (usando fallback ponderado): {e}")
+
+    # Fallback ponderado por longitud fonética y pausas de puntuación
+    raw_words = [w.strip() for w in script_text.split() if w.strip()]
+    if not raw_words:
+        return [{"word": "VIDEO", "start": 0.0, "end": total_duration}]
+
+    weights = []
+    for w in raw_words:
+        base_w = max(len(re.sub(r"[^a-zA-ZáéíóúÁÉÍÓÚñÑ0-9]", "", w)), 1)
+        if w.endswith((".", "!", "?", ":")):
+            base_w += 3.5
+        elif w.endswith((",", ";")):
+            base_w += 1.8
+        weights.append(float(base_w))
+
+    total_weight = sum(weights)
+    current_t = 0.0
+    fallback_aligned = []
+    for w, weight in zip(raw_words, weights):
+        dur = (weight / total_weight) * total_duration
+        fallback_aligned.append({
+            "word": w,
+            "start": current_t,
+            "end": min(current_t + dur, total_duration)
+        })
+        current_t += dur
+
+    return fallback_aligned
+
+def sanitize_ass_word(word: str) -> str:
+    return re.sub(r"[\{\}\\]", "", word).upper()
+
+def build_viral_ass_subtitles(words_timed: list[dict], ass_path: str, w: int, h: int, is_short: bool, total_duration: float):
+    """
+    Genera subtítulos .ASS estilo TikTok / Hormozi:
+    - Bordes negros gruesos, sombra profunda y fuente de alto impacto.
+    - Efecto 'Pop' elástico al cambiar de palabra y resaltado en Amarillo Neón (&H0000FFFF&) en la palabra activa.
+    """
+    font_size = 96 if is_short else 68
+    margin_v = 440 if is_short else 95
+    group_size = 3 if is_short else 5
+
+    ass_header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {w}
+PlayResY: {h}
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: ViralSub,Arial Black,{font_size},&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,1,0,1,7,4,2,40,40,{margin_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    lines = [ass_header]
+
+    for i in range(0, len(words_timed), group_size):
+        chunk = words_timed[i:i + group_size]
+        if not chunk:
+            continue
+
+        for active_idx, active_word in enumerate(chunk):
+            start_sec = active_word["start"]
+            if active_idx + 1 < len(chunk):
+                end_sec = max(active_word["end"], chunk[active_idx + 1]["start"])
+            elif i + group_size < len(words_timed):
+                end_sec = max(active_word["end"], min(words_timed[i + group_size]["start"], active_word["end"] + 0.35))
+            else:
+                end_sec = min(total_duration, max(active_word["end"] + 0.25, active_word["end"]))
+
+            if end_sec <= start_sec:
+                end_sec = start_sec + 0.15
+
+            styled_tokens = []
+            for idx_in_chunk, item in enumerate(chunk):
+                clean_w = sanitize_ass_word(item["word"])
+                if idx_in_chunk == active_idx:
+                    # Palabra activa en Amarillo Neón (&H0000FFFF&)
+                    styled_tokens.append(r"{\c&H0000FFFF&}" + clean_w + r"{\c&H00FFFFFF&}")
+                else:
+                    styled_tokens.append(clean_w)
+
+            # Animación Pop elástica al inicio del bloque o micro-impulso en palabra activa
+            pop_tag = r"{\fscx118\fscy118\t(0,110,\fscx100\fscy100)}" if active_idx == 0 else r"{\fscx106\fscy106\t(0,80,\fscx100\fscy100)}"
+            text_line = pop_tag + " ".join(styled_tokens)
+            lines.append(f"Dialogue: 0,{format_ass_time(start_sec)},{format_ass_time(end_sec)},ViralSub,,0,0,0,,{text_line}\n")
+
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
 
 async def prepare_background_music(duration: float, bgm_path: str):
     bgm_urls = [
@@ -339,9 +484,14 @@ async def prepare_background_music(duration: float, bgm_path: str):
         "-af", "lowpass=f=600", "-c:a", "pcm_s16le", bgm_path
     ], check=True)
 
-def postproducir_video_maestro(input_video: str, output_video: str, is_short: bool = True):
+def postproducir_video_maestro(input_video: str, output_video: str, is_short: bool = True, trim_silences: bool = True):
     w, h = (1080, 1920) if is_short else (1920, 1080)
-    filtro_audio = "silenceremove=stop_periods=-1:stop_duration=0.4:stop_threshold=-50dB,loudnorm=I=-16:TP=-1.5:LRA=11,acompressor"
+    if trim_silences:
+        filtro_audio = "silenceremove=stop_periods=-1:stop_duration=0.35:stop_threshold=-48dB,loudnorm=I=-16:TP=-1.5:LRA=11,acompressor"
+    else:
+        # Para videos generados donde la voz ya fue limpiada antes de alinear subtítulos
+        filtro_audio = "loudnorm=I=-16:TP=-1.5:LRA=11"
+
     filtro_video = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps=30"
 
     cmd = [
@@ -364,7 +514,7 @@ async def edit_uploaded_raw_video(video_url: str, prefix: str, is_short: bool = 
         res.raise_for_status()
         with open(raw_input, "wb") as f:
             f.write(res.content)
-    return postproducir_video_maestro(raw_input, final_video, is_short=is_short)
+    return postproducir_video_maestro(raw_input, final_video, is_short=is_short, trim_silences=True)
 
 async def render_video_with_real_clips(prefix: str, script_text: str, search_terms: list[str], is_short: bool = True) -> str:
     os.makedirs("output", exist_ok=True)
@@ -378,69 +528,61 @@ async def render_video_with_real_clips(prefix: str, script_text: str, search_ter
     raw_output = f"output/{prefix}_raw.mp4"
     final_video = f"output/{prefix}_final.mp4"
 
+    # 1. Generar voz en Kokoro con pre-supresión de silencios muertos
     await generate_voice_kokoro(script_text, voice_path, is_short=is_short)
     total_duration = get_audio_duration(voice_path)
 
+    # 2. Alinear palabras con precisión de milisegundos y construir subtítulos .ASS con Pop y Karaoke
+    words_timed = await get_word_timestamps(voice_path, script_text, total_duration)
+    build_viral_ass_subtitles(words_timed, ass_path, w, h, is_short, total_duration)
+
+    # 3. Preparar música de fondo y mezclar con sidechain/ducking limpio
     await prepare_background_music(total_duration, bgm_path)
     fade_start = max(0.0, total_duration - 2.0)
 
     subprocess.run([
         "ffmpeg", "-y", "-i", voice_path, "-i", bgm_path,
         "-filter_complex",
-        f"[0:a]equalizer=f=1000:t=q:w=1:g=3[v];[1:a]volume=0.10,afade=t=out:st={fade_start}:d=2[b];[v][b]amix=inputs=2:duration=first[aout]",
+        f"[0:a]volume=1.15[v];[1:a]volume=0.09,afade=t=out:st={fade_start}:d=2[b];[v][b]amix=inputs=2:duration=first[aout]",
         "-map", "[aout]", "-c:a", "aac", "-b:a", "192k", mixed_audio
     ], check=True)
 
-    words = script_text.split()
-    time_per_word = total_duration / max(len(words), 1)
-    font_size = 92 if is_short else 65
-    margin_v = 400 if is_short else 80
-
-    ass_header = f"""[Script Info]
-ScriptType: v4.00+
-PlayResX: {w}
-PlayResY: {h}
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ProSub,Arial Black,{font_size},&H0000FFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,6,3,2,30,30,{margin_v},1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
-    with open(ass_path, "w", encoding="utf-8") as f:
-        f.write(ass_header)
-        chunk_size = 2 if is_short else 4
-        for idx in range(0, len(words), chunk_size):
-            phrase = " ".join(words[idx:idx+chunk_size]).upper()
-            start = format_ass_time(idx * time_per_word)
-            end = format_ass_time(min((idx + chunk_size) * time_per_word, total_duration))
-            f.write(f"Dialogue: 0,{start},{end},ProSub,,0,0,0,,{phrase}\n")
+    # 4. Cortes dinámicos de B-Roll (cada 2.8s en Shorts y 3.8s en Largos para máxima retención visual)
+    target_cut_sec = 2.8 if is_short else 3.8
+    num_cuts = max(int(np.ceil(total_duration / target_cut_sec)), len(search_terms), 4)
+    clip_duration = total_duration / num_cuts
 
     clip_paths = []
-    clip_duration = max(total_duration / len(search_terms), 3.0)
+    used_video_ids = set()
 
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=BROWSER_HEADERS) as client:
-        for i, term in enumerate(search_terms):
+        for i in range(num_cuts):
+            term = search_terms[i % len(search_terms)]
             clip_file = f"output/{prefix}_clip_{i}.mp4"
             got_clip = False
             if PEXELS_API_KEY:
                 try:
-                    pexels_url = f"https://api.pexels.com/videos/search?query={urllib.parse.quote(term)}&orientation={orientation}&per_page=5"
+                    pexels_url = f"https://api.pexels.com/videos/search?query={urllib.parse.quote(term)}&orientation={orientation}&per_page=8"
                     r = await client.get(pexels_url, headers={"Authorization": PEXELS_API_KEY})
-                    videos = r.json().get("videos", [])
+                    videos = [v for v in r.json().get("videos", []) if v.get("id") not in used_video_ids]
+                    if not videos:
+                        videos = r.json().get("videos", [])
                     if videos:
-                        chosen = np.random.choice(videos)
+                        chosen = videos[i % len(videos)]
+                        used_video_ids.add(chosen.get("id"))
                         vfiles = chosen.get("video_files", [])
                         if vfiles:
-                            best = max(vfiles, key=lambda x: x.get("width", 0))
+                            # Elegir calidad HD óptima sin exceder memoria
+                            hd_files = [vf for vf in vfiles if 720 <= vf.get("width", 0) <= 1920] or vfiles
+                            best = max(hd_files, key=lambda x: x.get("width", 0))
                             vid_data = await client.get(best["link"])
                             raw_vid = f"output/{prefix}_source_{i}.mp4"
                             with open(raw_vid, "wb") as f:
                                 f.write(vid_data.content)
+                            # Reencuadre, contraste cinematográfico (eq) y nitidez (unsharp)
                             subprocess.run([
                                 "ffmpeg", "-y", "-stream_loop", "-1", "-t", str(clip_duration), "-i", raw_vid,
-                                "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps=30",
+                                "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},eq=contrast=1.06:saturation=1.12,unsharp=5:5:0.8:3:3:0.4,fps=30",
                                 "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", clip_file
                             ], check=True)
                             got_clip = True
@@ -467,7 +609,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         "-c:a", "aac", "-b:a", "192k", "-shortest", raw_output
     ], check=True)
 
-    postproducir_video_maestro(raw_output, final_video, is_short=is_short)
+    # Masterización final broadcast (-16 LUFS) sin recortar silencios post-subtítulos para no desfasar el karaoke
+    postproducir_video_maestro(raw_output, final_video, is_short=is_short, trim_silences=False)
     return final_video
 
 def upload_youtube_rotated(video_path: str, title: str, description: str, tags: list[str], is_short: bool = True, publish_at: str = None) -> str:
@@ -502,7 +645,7 @@ def upload_youtube_rotated(video_path: str, title: str, description: str, tags: 
 
 async def main():
     try:
-        await send_telegram(f"🚀 <b>Iniciando Fábrica Pro v4.0</b>\n📺 <b>Canal:</b> {CHANNEL_NAME}\n📌 <b>Tarea:</b> {RAW_TOPIC}")
+        await send_telegram(f"🚀 <b>Iniciando Fábrica Pro v4.0 (Subtítulos Pop + Cortes Dinámicos)</b>\n📺 <b>Canal:</b> {CHANNEL_NAME}\n📌 <b>Tarea:</b> {RAW_TOPIC}")
 
         if SOURCE_VIDEO_URL:
             is_short_mode = (MODE_CHOICE == "1")
