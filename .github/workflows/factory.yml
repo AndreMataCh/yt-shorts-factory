@@ -43,17 +43,23 @@ jobs:
           # Canal 3
           if [ -n "$YT_CH3_TOKEN_1" ]; then echo "$YT_CH3_TOKEN_1" > tokens/ch3_token_1.json; fi
 
-      - name: Ejecutar Fábrica
+      - name: Ejecutar Fábrica Pro
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-          CHANNEL_ID: ${{ github.event.client_payload.channel_id || 'ch1' }}
-          TOPIC: ${{ github.event.client_payload.topic || 'Las 3 paradojas más extrañas del tiempo' }}
-          VISUAL_STYLE: ${{ github.event.client_payload.visual_style || '1' }}
-          VOICE_STYLE: ${{ github.event.client_payload.voice_style || '1' }}
-          VIDEO_COUNT: ${{ github.event.client_payload.video_count || '1' }}
-          MODE: ${{ github.event.client_payload.mode || '3' }}
-          CHAT_ID: ${{ github.event.client_payload.chat_id || secrets.TELEGRAM_CHAT_ID }}
-        run: python run_job.py
+          CHANNEL_ID: ${{ github.event.client_payload.channel_id }}
+          CHANNEL_NAME: ${{ github.event.client_payload.channel_name }}
+          CHANNEL_TOKEN_JSON: ${{ github.event.client_payload.channel_token_json }}
+          TOPIC: ${{ github.event.client_payload.topic }}
+          VISUAL_STYLE: ${{ github.event.client_payload.visual_style }}
+          VOICE_STYLE: ${{ github.event.client_payload.voice_style }}
+          VIDEO_COUNT: ${{ github.event.client_payload.video_count }}
+          MODE: ${{ github.event.client_payload.mode }}
+          MONETIZATION_URL: ${{ github.event.client_payload.monetization_url }}
+          CUSTOM_TITLE: ${{ github.event.client_payload.custom_title }}
+          CUSTOM_DESCRIPTION: ${{ github.event.client_payload.custom_description }}
+          SOURCE_VIDEO_URL: ${{ github.event.client_payload.source_video_url }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: python3 run_job.py
