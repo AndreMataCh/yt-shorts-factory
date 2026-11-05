@@ -59,50 +59,94 @@ def clean_llm_output(text: str) -> str:
     return cleaned.strip()
 
 async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
+    errors = []
+
+    # 1. Intento con Google Gemini (probando modelos en cascada)
     if GEMINI_API_KEY:
-        async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS) as client:
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-                res = await client.post(url, json={"contents": [{"parts": [{"text": prompt}]}]})
-                if res.status_code == 200:
-                    candidates = res.json().get("candidates", [])
-                    if candidates:
-                        content = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+        for model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
+            async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS) as client:
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+                    res = await client.post(url, json={"contents": [{"parts": [{"text": prompt}]}]})
+                    if res.status_code == 200:
+                        candidates = res.json().get("candidates", [])
+                        if candidates:
+                            content = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                            cleaned = clean_llm_output(content)
+                            if cleaned:
+                                return cleaned
+                    else:
+                        errors.append(f"Gemini ({model}): HTTP {res.status_code} - {res.text[:120]}")
+                except Exception as e:
+                    errors.append(f"Gemini ({model}) Excepción: {str(e)}")
+    else:
+        errors.append("GEMINI_API_KEY vacía")
+
+    # 2. Intento con Groq (probando modelos en cascada)
+    if GROQ_API_KEY:
+        headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                try:
+                    res = await client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers=headers,
+                        json={
+                            "model": model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.7,
+                            "max_tokens": max_tokens
+                        }
+                    )
+                    if res.status_code == 200:
+                        content = res.json()["choices"][0]["message"].get("content") or ""
                         cleaned = clean_llm_output(content)
                         if cleaned:
                             return cleaned
-            except Exception:
-                pass
+                    else:
+                        errors.append(f"Groq ({model}): HTTP {res.status_code} - {res.text[:120]}")
+                except Exception as e:
+                    errors.append(f"Groq ({model}) Excepción: {str(e)}")
+    else:
+        errors.append("GROQ_API_KEY vacía")
 
-    if GROQ_API_KEY:
-        headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-        async with httpx.AsyncClient(timeout=60.0) as client:
+    # 3. Respaldo gratuito 1: Pollinations vía POST (OpenAI-compatible endpoint)
+    async with httpx.AsyncClient(timeout=60.0, headers={**BROWSER_HEADERS, "Content-Type": "application/json"}, follow_redirects=True) as client:
+        for poly_model in ["openai", "mistral", "llama"]:
             try:
                 res = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers,
+                    "https://text.pollinations.ai/",
                     json={
-                        "model": "llama-3.3-70b-versatile",
                         "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.7,
-                        "max_tokens": max_tokens
+                        "model": poly_model,
+                        "jsonMode": False
                     }
                 )
-                if res.status_code == 200:
-                    content = res.json()["choices"][0]["message"].get("content") or ""
-                    cleaned = clean_llm_output(content)
-                    if cleaned:
+                if res.status_code == 200 and len(res.text.strip()) > 10:
+                    cleaned = clean_llm_output(res.text)
+                    if cleaned and "<!DOCTYPE html>" not in cleaned:
                         return cleaned
-            except Exception:
-                pass
+                else:
+                    errors.append(f"Pollinations POST ({poly_model}): HTTP {res.status_code}")
+            except Exception as e:
+                errors.append(f"Pollinations POST ({poly_model}) Excepción: {str(e)}")
 
-    async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS, follow_redirects=True) as client:
-        encoded_p = urllib.parse.quote(prompt[:1500])
-        res = await client.get(f"https://text.pollinations.ai/{encoded_p}")
-        if res.status_code == 200:
-            return clean_llm_output(res.text)
+    # 4. Respaldo gratuito 2: Pollinations GET corto
+    async with httpx.AsyncClient(timeout=45.0, headers=BROWSER_HEADERS, follow_redirects=True) as client:
+        try:
+            encoded_p = urllib.parse.quote(prompt[:800])
+            res = await client.get(f"https://text.pollinations.ai/{encoded_p}")
+            if res.status_code == 200 and "<!DOCTYPE html>" not in res.text:
+                cleaned = clean_llm_output(res.text)
+                if cleaned:
+                    return cleaned
+            errors.append(f"Pollinations GET: HTTP {res.status_code}")
+        except Exception as e:
+            errors.append(f"Pollinations GET Excepción: {str(e)}")
 
-    raise RuntimeError("Falla total de LLMs en la generación de guiones.")
+    detalle_errores = " | ".join(errors)
+    print(f"Detalle de fallos LLM: {detalle_errores}")
+    raise RuntimeError(f"Falla total de LLMs. Detalles: {detalle_errores[:350]}")
 
 async def generate_long_plan(topic: str) -> dict:
     script_prompt = (
@@ -129,10 +173,11 @@ async def generate_long_plan(topic: str) -> dict:
         "search_terms": terms
     }
 
-async def generate_teaser_short_plan(topic: str, long_title: str, long_url: str) -> dict:
+async def generate_teaser_short_plan(topic: str, long_title: str = "", long_url: str = "") -> dict:
+    cta_line = "Descubre el video completo en el enlace de la descripción." if long_url else "Suscríbete para descubrir más secretos como este."
     script_prompt = (
         f"Escribe un guion de YouTube Short ultradinámico de 30 segundos sobre '{topic}'. "
-        f"Empieza con un gancho agresivo y termina diciendo: 'Descubre el video completo en el enlace de la descripción.' "
+        f"Empieza con un gancho agresivo y termina diciendo: '{cta_line}' "
         "REGLAS: Devuelve ÚNICAMENTE el texto hablado en español neutro, sin asteriscos ni emojis."
     )
     script = re.sub(r"[\*\#\[\]\(\)]", "", await ask_llm(script_prompt, max_tokens=600)).strip()
@@ -146,9 +191,10 @@ async def generate_teaser_short_plan(topic: str, long_title: str, long_url: str)
     while len(terms) < 6:
         terms.append("fast paced abstract motion")
 
+    desc_link = f"\n\n🔗 Video completo: {long_url}" if long_url else ""
     return {
         "title": title,
-        "description": f"{title}\n\n🔗 Video completo: {long_url}\n\n#Shorts #Tech",
+        "description": f"{title}{desc_link}\n\n#Shorts #Tech",
         "tags": ["shorts", "tecnologia"],
         "script": script,
         "search_terms": terms
@@ -209,14 +255,9 @@ async def prepare_background_music(duration: float, bgm_path: str):
         "-af", "lowpass=f=600", "-c:a", "pcm_s16le", bgm_path
     ], check=True)
 
-# === MÓDULO DE POSTPRODUCCIÓN Y EDICIÓN PROFESIONAL (ELIMINACIÓN DE SILENCIOS Y MASTERIZACIÓN) ===
 def postproducir_video_maestro(input_video: str, output_video: str, is_short: bool = True):
     w, h = (1080, 1920) if is_short else (1920, 1080)
     
-    # Filtro avanzado FFmpeg:
-    # 1. silenceremove: quita silencios muertos (-50dB)
-    # 2. loudnorm: ecualización y normalización de estudio (-16 LUFS)
-    # 3. scale/crop: reencuadre dinámico cinematográfico
     filtro_audio = "silenceremove=stop_periods=-1:stop_duration=0.4:stop_threshold=-50dB,loudnorm=I=-16:TP=-1.5:LRA=11,acompressor"
     filtro_video = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps=30"
 
@@ -325,7 +366,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         for cp in clip_paths:
             f.write(f"file '{cp}'\n")
 
-    # Ensamblaje bruto inicial
     subprocess.run([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
         "-i", mixed_audio, "-vf", f"ass={ass_path}",
@@ -333,14 +373,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         "-c:a", "aac", "-b:a", "192k", "-shortest", raw_output
     ], check=True)
 
-    # Postproducción maestra: eliminación de silencios, masterización y pulido cinematográfico
     postproducir_video_maestro(raw_output, final_video, is_short=is_short)
     return final_video
 
 def upload_youtube_rotated(video_path: str, title: str, description: str, tags: list[str], is_short: bool = True, publish_at: str = None) -> str:
     channel_tokens = sorted(glob.glob(f"tokens/{CHANNEL_ID}_token_*.json")) or sorted(glob.glob("tokens/*.json"))
     if not channel_tokens:
-        raise RuntimeError("No se encontraron tokens de YouTube.")
+        raise RuntimeError(f"No se encontraron tokens de YouTube para el canal '{CHANNEL_ID}'. Verifica tus Secrets en GitHub.")
 
     status_body = {"selfDeclaredMadeForKids": False}
     if publish_at:
@@ -365,7 +404,7 @@ def upload_youtube_rotated(video_path: str, title: str, description: str, tags: 
             if e.resp.status in [403, 429]:
                 continue
             raise e
-    raise RuntimeError("Cuota agotada en todos los tokens de YouTube.")
+    raise RuntimeError("Cuota agotada en todos los tokens de YouTube disponibles.")
 
 async def main():
     try:
@@ -373,15 +412,23 @@ async def main():
         subtopics = [RAW_TOPIC]
         
         for idx, topic in enumerate(subtopics, start=1):
-            long_plan = await generate_long_plan(topic)
-            long_vid = await render_video_with_real_clips(f"long_{idx}", long_plan["script"], long_plan["search_terms"], is_short=False)
-            long_url = upload_youtube_rotated(long_vid, long_plan["title"], long_plan["description"], long_plan["tags"], is_short=False)
-            await send_telegram(f"✅ Video Largo Pro Publicado:\n📺 {long_plan['title']}\n🔗 {long_url}")
+            long_url = ""
+            long_title = topic
 
-            short_plan = await generate_teaser_short_plan(topic, long_plan["title"], long_url)
-            short_vid = await render_video_with_real_clips(f"short_{idx}", short_plan["script"], short_plan["search_terms"], is_short=True)
-            short_url = upload_youtube_rotated(short_vid, short_plan["title"], short_plan["description"], short_plan["tags"], is_short=True)
-            await send_telegram(f"🔥 Short Dinámico Pro Publicado:\n🔗 {short_url}")
+            # Modo 2 (Solo Largo) o Modo 3 (Embudo Completo)
+            if MODE_CHOICE in ["2", "3"]:
+                long_plan = await generate_long_plan(topic)
+                long_title = long_plan["title"]
+                long_vid = await render_video_with_real_clips(f"long_{idx}", long_plan["script"], long_plan["search_terms"], is_short=False)
+                long_url = upload_youtube_rotated(long_vid, long_plan["title"], long_plan["description"], long_plan["tags"], is_short=False)
+                await send_telegram(f"✅ Video Largo Pro Publicado:\n📺 {long_plan['title']}\n🔗 {long_url}")
+
+            # Modo 1 (Solo Short) o Modo 3 (Embudo Completo)
+            if MODE_CHOICE in ["1", "3"]:
+                short_plan = await generate_teaser_short_plan(topic, long_title, long_url)
+                short_vid = await render_video_with_real_clips(f"short_{idx}", short_plan["script"], short_plan["search_terms"], is_short=True)
+                short_url = upload_youtube_rotated(short_vid, short_plan["title"], short_plan["description"], short_plan["tags"], is_short=True)
+                await send_telegram(f"🔥 Short Dinámico Pro Publicado:\n🔗 {short_url}")
 
         await send_telegram("🏁 ¡Tanda profesional y masterizada completada con éxito!")
     except Exception as e:
