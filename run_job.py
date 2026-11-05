@@ -1,10 +1,10 @@
 import os
 import re
 import glob
+import json
 import asyncio
 import subprocess
 import urllib.parse
-from datetime import datetime, timedelta, timezone
 import httpx
 import numpy as np
 import soundfile as sf
@@ -14,18 +14,26 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
-# === CONFIGURACIÓN Y VARIABLES DE ENTORNO ===
+# === VARIABLES DE ENTORNO Y PAYLOAD DE PAULA / WORKER ===
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 PEXELS_API_KEY = (os.getenv("PEXELS_API_KEY") or "").strip()
 
 CHANNEL_ID = (os.getenv("CHANNEL_ID") or "ch1").strip().lower()
+CHANNEL_NAME = (os.getenv("CHANNEL_NAME") or CHANNEL_ID.upper()).strip()
+CHANNEL_TOKEN_JSON = (os.getenv("CHANNEL_TOKEN_JSON") or "").strip()
+
 RAW_TOPIC = (os.getenv("TOPIC") or "Los secretos mejor guardados de la tecnología").strip()
 VISUAL_STYLE = (os.getenv("VISUAL_STYLE") or "1").strip()
 VOICE_STYLE = (os.getenv("VOICE_STYLE") or "1").strip()
 RAW_COUNT = (os.getenv("VIDEO_COUNT") or "1").strip()
 MODE_CHOICE = (os.getenv("MODE") or "3").strip()
+
+MONETIZATION_URL = (os.getenv("MONETIZATION_URL") or "").strip()
+CUSTOM_TITLE = (os.getenv("CUSTOM_TITLE") or "").strip()
+CUSTOM_DESCRIPTION = (os.getenv("CUSTOM_DESCRIPTION") or "").strip()
+SOURCE_VIDEO_URL = (os.getenv("SOURCE_VIDEO_URL") or "").strip()
 CHAT_ID = (os.getenv("CHAT_ID") or "").strip()
 
 try:
@@ -37,7 +45,18 @@ BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 }
 
-print("Inicializando motor neuronal Kokoro-82M de alta fidelidad...")
+# Materializar el token enviado desde Cloudflare KV (Arquitectura PAULA)
+os.makedirs("tokens", exist_ok=True)
+if CHANNEL_TOKEN_JSON:
+    try:
+        parsed_tok = json.loads(CHANNEL_TOKEN_JSON)
+        with open(f"tokens/{CHANNEL_ID}_token_kv.json", "w", encoding="utf-8") as f:
+            json.dump(parsed_tok, f)
+        print(f"Token OAuth cargado desde Cloudflare KV para el canal: {CHANNEL_NAME} ({CHANNEL_ID})")
+    except Exception as e:
+        print(f"Aviso al parsear CHANNEL_TOKEN_JSON: {e}")
+
+print("Inicializando motor neuronal Kokoro-82M...")
 kokoro_pipeline = KPipeline(lang_code='e')
 
 async def send_telegram(text: str):
@@ -47,7 +66,7 @@ async def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     async with httpx.AsyncClient() as client:
         try:
-            await client.post(url, json={"chat_id": int(CHAT_ID), "text": text})
+            await client.post(url, json={"chat_id": int(CHAT_ID), "text": text, "parse_mode": "HTML"})
         except Exception as e:
             print(f"Aviso Telegram: {e}")
 
@@ -61,7 +80,6 @@ def clean_llm_output(text: str) -> str:
 async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
     errors = []
 
-    # 1. Intento con Google Gemini (probando modelos en cascada)
     if GEMINI_API_KEY:
         for model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
             async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS) as client:
@@ -76,13 +94,10 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                             if cleaned:
                                 return cleaned
                     else:
-                        errors.append(f"Gemini ({model}): HTTP {res.status_code} - {res.text[:120]}")
+                        errors.append(f"Gemini ({model}): HTTP {res.status_code}")
                 except Exception as e:
-                    errors.append(f"Gemini ({model}) Excepción: {str(e)}")
-    else:
-        errors.append("GEMINI_API_KEY vacía")
+                    errors.append(f"Gemini ({model}): {str(e)}")
 
-    # 2. Intento con Groq (probando modelos en cascada)
     if GROQ_API_KEY:
         headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
@@ -104,34 +119,24 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                         if cleaned:
                             return cleaned
                     else:
-                        errors.append(f"Groq ({model}): HTTP {res.status_code} - {res.text[:120]}")
+                        errors.append(f"Groq ({model}): HTTP {res.status_code}")
                 except Exception as e:
-                    errors.append(f"Groq ({model}) Excepción: {str(e)}")
-    else:
-        errors.append("GROQ_API_KEY vacía")
+                    errors.append(f"Groq ({model}): {str(e)}")
 
-    # 3. Respaldo gratuito 1: Pollinations vía POST (OpenAI-compatible endpoint)
     async with httpx.AsyncClient(timeout=60.0, headers={**BROWSER_HEADERS, "Content-Type": "application/json"}, follow_redirects=True) as client:
         for poly_model in ["openai", "mistral", "llama"]:
             try:
                 res = await client.post(
                     "https://text.pollinations.ai/",
-                    json={
-                        "messages": [{"role": "user", "content": prompt}],
-                        "model": poly_model,
-                        "jsonMode": False
-                    }
+                    json={"messages": [{"role": "user", "content": prompt}], "model": poly_model, "jsonMode": False}
                 )
                 if res.status_code == 200 and len(res.text.strip()) > 10:
                     cleaned = clean_llm_output(res.text)
                     if cleaned and "<!DOCTYPE html>" not in cleaned:
                         return cleaned
-                else:
-                    errors.append(f"Pollinations POST ({poly_model}): HTTP {res.status_code}")
             except Exception as e:
-                errors.append(f"Pollinations POST ({poly_model}) Excepción: {str(e)}")
+                errors.append(f"Pollinations POST ({poly_model}): {str(e)}")
 
-    # 4. Respaldo gratuito 2: Pollinations GET corto
     async with httpx.AsyncClient(timeout=45.0, headers=BROWSER_HEADERS, follow_redirects=True) as client:
         try:
             encoded_p = urllib.parse.quote(prompt[:800])
@@ -140,13 +145,10 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                 cleaned = clean_llm_output(res.text)
                 if cleaned:
                     return cleaned
-            errors.append(f"Pollinations GET: HTTP {res.status_code}")
         except Exception as e:
-            errors.append(f"Pollinations GET Excepción: {str(e)}")
+            errors.append(f"Pollinations GET: {str(e)}")
 
-    detalle_errores = " | ".join(errors)
-    print(f"Detalle de fallos LLM: {detalle_errores}")
-    raise RuntimeError(f"Falla total de LLMs. Detalles: {detalle_errores[:350]}")
+    raise RuntimeError(f"Falla de LLMs: {' | '.join(errors)[:300]}")
 
 async def generate_long_plan(topic: str) -> dict:
     script_prompt = (
@@ -155,19 +157,22 @@ async def generate_long_plan(topic: str) -> dict:
         "REGLAS: Devuelve ÚNICAMENTE el texto hablado. Sin asteriscos, sin títulos, sin emojis."
     )
     script = re.sub(r"[\*\#\[\]\(\)]", "", await ask_llm(script_prompt, max_tokens=1400)).strip()
-    title = (await ask_llm(f"Crea un título magnético de YouTube (máx 65 caracteres) sobre '{topic}'. SOLO el título sin comillas.", max_tokens=150)).replace('"', '').splitlines()[0].strip()[:75]
+    title = CUSTOM_TITLE or (await ask_llm(f"Crea un título magnético de YouTube (máx 65 caracteres) sobre '{topic}'. SOLO el título sin comillas.", max_tokens=150)).replace('"', '').splitlines()[0].strip()[:75]
 
     terms_raw = await ask_llm(
-        f"For the topic '{topic}', provide exactly 10 distinct, highly dynamic cinematic video search keywords in English (e.g., fast motion futuristic city, neon cyberpunk drone shot, macro glowing particles). Return ONLY the 10 comma-separated terms.",
+        f"For the topic '{topic}', provide exactly 10 distinct, dynamic cinematic video search keywords in English. Return ONLY the 10 comma-separated terms.",
         max_tokens=300
     )
     terms = [t.strip() for t in terms_raw.split(",") if t.strip()][:10]
     while len(terms) < 10:
         terms.append("cinematic abstract motion background")
 
+    monetization_block = f"\n\n🔥 Recursos y enlaces exclusivos: {MONETIZATION_URL}" if MONETIZATION_URL else ""
+    base_desc = CUSTOM_DESCRIPTION or f"{title}\n\nExploramos a fondo: {topic}.\n\n{script[:250]}..."
+
     return {
         "title": title,
-        "description": f"{title}\n\nExploramos a fondo: {topic}.\n\n{script[:250]}...\n\n#Documental #Tecnologia #Viral",
+        "description": f"{base_desc}{monetization_block}\n\n#Documental #Tecnologia #Viral",
         "tags": ["documental", "tecnologia", "ciencia", "viral"],
         "script": script,
         "search_terms": terms
@@ -192,9 +197,10 @@ async def generate_teaser_short_plan(topic: str, long_title: str = "", long_url:
         terms.append("fast paced abstract motion")
 
     desc_link = f"\n\n🔗 Video completo: {long_url}" if long_url else ""
+    monetization_block = f"\n🔥 Enlace destacado: {MONETIZATION_URL}" if MONETIZATION_URL else ""
     return {
         "title": title,
-        "description": f"{title}{desc_link}\n\n#Shorts #Tech",
+        "description": f"{title}{desc_link}{monetization_block}\n\n#Shorts #Tech",
         "tags": ["shorts", "tecnologia"],
         "script": script,
         "search_terms": terms
@@ -257,7 +263,6 @@ async def prepare_background_music(duration: float, bgm_path: str):
 
 def postproducir_video_maestro(input_video: str, output_video: str, is_short: bool = True):
     w, h = (1080, 1920) if is_short else (1920, 1080)
-    
     filtro_audio = "silenceremove=stop_periods=-1:stop_duration=0.4:stop_threshold=-50dB,loudnorm=I=-16:TP=-1.5:LRA=11,acompressor"
     filtro_video = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps=30"
 
@@ -271,6 +276,17 @@ def postproducir_video_maestro(input_video: str, output_video: str, is_short: bo
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return output_video
+
+async def edit_uploaded_raw_video(video_url: str, prefix: str, is_short: bool = True) -> str:
+    os.makedirs("output", exist_ok=True)
+    raw_input = f"output/{prefix}_uploaded_raw.mp4"
+    final_video = f"output/{prefix}_edited_pro.mp4"
+    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True, headers=BROWSER_HEADERS) as client:
+        res = await client.get(video_url)
+        res.raise_for_status()
+        with open(raw_input, "wb") as f:
+            f.write(res.content)
+    return postproducir_video_maestro(raw_input, final_video, is_short=is_short)
 
 async def render_video_with_real_clips(prefix: str, script_text: str, search_terms: list[str], is_short: bool = True) -> str:
     os.makedirs("output", exist_ok=True)
@@ -289,7 +305,7 @@ async def render_video_with_real_clips(prefix: str, script_text: str, search_ter
 
     await prepare_background_music(total_duration, bgm_path)
     fade_start = max(0.0, total_duration - 2.0)
-    
+
     subprocess.run([
         "ffmpeg", "-y", "-i", voice_path, "-i", bgm_path,
         "-filter_complex",
@@ -379,7 +395,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 def upload_youtube_rotated(video_path: str, title: str, description: str, tags: list[str], is_short: bool = True, publish_at: str = None) -> str:
     channel_tokens = sorted(glob.glob(f"tokens/{CHANNEL_ID}_token_*.json")) or sorted(glob.glob("tokens/*.json"))
     if not channel_tokens:
-        raise RuntimeError(f"No se encontraron tokens de YouTube para el canal '{CHANNEL_ID}'. Verifica tus Secrets en GitHub.")
+        raise RuntimeError(f"No se encontraron tokens para el canal '{CHANNEL_NAME}' ({CHANNEL_ID}). Conéctalo desde el botón OAuth de Telegram.")
 
     status_body = {"selfDeclaredMadeForKids": False}
     if publish_at:
@@ -404,35 +420,43 @@ def upload_youtube_rotated(video_path: str, title: str, description: str, tags: 
             if e.resp.status in [403, 429]:
                 continue
             raise e
-    raise RuntimeError("Cuota agotada en todos los tokens de YouTube disponibles.")
+    raise RuntimeError("Cuota agotada en los tokens de YouTube disponibles.")
 
 async def main():
     try:
-        await send_telegram(f"🚀 Iniciando Fábrica Pro con Postproducción y Supresión de Silencios en canal: {CHANNEL_ID.upper()}")
+        await send_telegram(f"🚀 <b>Iniciando Fábrica Pro v4.0</b>\n📺 <b>Canal:</b> {CHANNEL_NAME}\n📌 <b>Tarea:</b> {RAW_TOPIC}")
+
+        # Si el usuario o PAULA envió un video ya grabado para postproducción profesional
+        if SOURCE_VIDEO_URL:
+            is_short_mode = (MODE_CHOICE == "1")
+            edited_vid = await edit_uploaded_raw_video(SOURCE_VIDEO_URL, "raw_edit", is_short=is_short_mode)
+            title = CUSTOM_TITLE or RAW_TOPIC[:80]
+            desc = CUSTOM_DESCRIPTION or f"{title}\n\n{MONETIZATION_URL}"
+            vid_url = upload_youtube_rotated(edited_vid, title, desc, ["viral", "pro"], is_short=is_short_mode)
+            await send_telegram(f"✅ <b>Video Pregrabado Masterizado y Publicado:</b>\n🔗 {vid_url}")
+            return
+
         subtopics = [RAW_TOPIC]
-        
         for idx, topic in enumerate(subtopics, start=1):
             long_url = ""
             long_title = topic
 
-            # Modo 2 (Solo Largo) o Modo 3 (Embudo Completo)
             if MODE_CHOICE in ["2", "3"]:
                 long_plan = await generate_long_plan(topic)
                 long_title = long_plan["title"]
                 long_vid = await render_video_with_real_clips(f"long_{idx}", long_plan["script"], long_plan["search_terms"], is_short=False)
                 long_url = upload_youtube_rotated(long_vid, long_plan["title"], long_plan["description"], long_plan["tags"], is_short=False)
-                await send_telegram(f"✅ Video Largo Pro Publicado:\n📺 {long_plan['title']}\n🔗 {long_url}")
+                await send_telegram(f"✅ <b>Video Largo Publicado en {CHANNEL_NAME}:</b>\n📺 {long_plan['title']}\n🔗 {long_url}")
 
-            # Modo 1 (Solo Short) o Modo 3 (Embudo Completo)
             if MODE_CHOICE in ["1", "3"]:
                 short_plan = await generate_teaser_short_plan(topic, long_title, long_url)
                 short_vid = await render_video_with_real_clips(f"short_{idx}", short_plan["script"], short_plan["search_terms"], is_short=True)
                 short_url = upload_youtube_rotated(short_vid, short_plan["title"], short_plan["description"], short_plan["tags"], is_short=True)
-                await send_telegram(f"🔥 Short Dinámico Pro Publicado:\n🔗 {short_url}")
+                await send_telegram(f"🔥 <b>Short Dinámico Publicado en {CHANNEL_NAME}:</b>\n🔗 {short_url}")
 
-        await send_telegram("🏁 ¡Tanda profesional y masterizada completada con éxito!")
+        await send_telegram(f"🏁 <b>¡Tanda finalizada con éxito en {CHANNEL_NAME}!</b>")
     except Exception as e:
-        await send_telegram(f"❌ Error crítico en fábrica: {str(e)}")
+        await send_telegram(f"❌ <b>Error crítico en fábrica ({CHANNEL_NAME}):</b>\n<code>{str(e)}</code>")
         raise e
 
 if __name__ == "__main__":
