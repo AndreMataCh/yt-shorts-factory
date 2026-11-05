@@ -64,6 +64,16 @@ if CHANNEL_TOKEN_JSON:
 print("Inicializando motor neuronal Kokoro-82M...")
 kokoro_pipeline = KPipeline(lang_code='e')
 
+def run_ffmpeg(cmd: list[str], step_desc: str = "FFmpeg"):
+    """Ejecuta FFmpeg capturando stderr para mostrar la causa exacta si algo falla."""
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if res.returncode != 0:
+        err_msg = res.stderr.decode("utf-8", errors="ignore")
+        tail_err = "\n".join(err_msg.splitlines()[-15:])
+        print(f"❌ Error en {step_desc} (Código {res.returncode}):\n{tail_err}")
+        raise RuntimeError(f"Fallo en {step_desc} (Exit {res.returncode}): {tail_err[-300:]}")
+    return res
+
 async def send_telegram(text: str):
     print(text)
     if not BOT_TOKEN or not CHAT_ID:
@@ -251,14 +261,12 @@ async def generate_teaser_short_plan(topic: str, long_title: str = "", long_url:
     }
 
 def format_ass_time(seconds: float) -> str:
-    seconds = max(0.0, seconds)
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    cs = int(round((seconds % 1) * 100))
-    if cs >= 100:
-        s += 1
-        cs = 0
+    """Convierte segundos a formato H:MM:SS.CC con acarreo exacto para evitar segundos = 60."""
+    total_cs = int(round(max(0.0, float(seconds)) * 100))
+    h = total_cs // 360000
+    m = (total_cs % 360000) // 6000
+    s = (total_cs % 6000) // 100
+    cs = total_cs % 100
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 def get_audio_duration(audio_path: str) -> float:
@@ -289,11 +297,11 @@ async def generate_voice_kokoro(script_text: str, audio_path: str, is_short: boo
         "equalizer=f=180:t=q:w=1:g=2,equalizer=f=3200:t=q:w=1:g=3,"
         "acompressor=threshold=-16dB:ratio=3:attack=5:release=50"
     )
-    subprocess.run([
+    run_ffmpeg([
         "ffmpeg", "-y", "-i", raw_voice,
         "-af", filtro_voz,
-        "-c:a", "pcm_s16le", "-ar", "24000", audio_path
-    ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        "-c:a", "pcm_s16le", "-ar", "24000", "-ac", "1", audio_path
+    ], "Limpieza de voz Kokoro")
 
 async def get_word_timestamps(audio_path: str, script_text: str, total_duration: float) -> list[dict]:
     if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
@@ -301,7 +309,12 @@ async def get_word_timestamps(audio_path: str, script_text: str, total_duration:
             async with httpx.AsyncClient(timeout=45.0) as client:
                 with open(audio_path, "rb") as f:
                     files = {"file": ("voice.wav", f, "audio/wav")}
-                    data = {"model": "whisper-large-v3-turbo", "response_format": "verbose_json", "timestamp_granularities[]": "word", "language": "es"}
+                    data = {
+                        "model": "whisper-large-v3-turbo",
+                        "response_format": "verbose_json",
+                        "timestamp_granularities[]": "word",
+                        "language": "es"
+                    }
                     res = await client.post(
                         "https://api.groq.com/openai/v1/audio/transcriptions",
                         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
@@ -314,7 +327,11 @@ async def get_word_timestamps(audio_path: str, script_text: str, total_duration:
                     for w in words_data:
                         txt = (w.get("word") or "").strip()
                         if txt:
-                            aligned.append({"word": txt, "start": float(w.get("start", 0.0)), "end": float(w.get("end", 0.0))})
+                            aligned.append({
+                                "word": txt,
+                                "start": float(w.get("start", 0.0)),
+                                "end": float(w.get("end", 0.0))
+                            })
                     if len(aligned) >= 3:
                         return aligned
         except Exception:
@@ -338,7 +355,11 @@ async def get_word_timestamps(audio_path: str, script_text: str, total_duration:
     fallback_aligned = []
     for w, weight in zip(raw_words, weights):
         dur = (weight / total_weight) * total_duration
-        fallback_aligned.append({"word": w, "start": current_t, "end": min(current_t + dur, total_duration)})
+        fallback_aligned.append({
+            "word": w,
+            "start": current_t,
+            "end": min(current_t + dur, total_duration)
+        })
         current_t += dur
 
     return fallback_aligned
@@ -346,20 +367,57 @@ async def get_word_timestamps(audio_path: str, script_text: str, total_duration:
 def get_channel_subtitle_profile(channel_name: str, topic: str) -> dict:
     text_sig = (channel_name + " " + topic).lower()
     if any(k in text_sig for k in ['finan', 'cripto', 'dinero', 'banco', 'invers', 'negocio', 'bitcoin']):
-        return {"primary_color": "&H0000D7FF&", "active_color": "&H0000FF7F&", "outline_color": "&H00000000&", "font_name": "Arial Black", "font_size_short": 98}
-    elif any(k in text_sig for k in ['terror', 'misteri', 'oscuro', 'crimen', 'miedo', 'secreto', 'paranormal']):
-        return {"primary_color": "&H00FFFFFF&", "active_color": "&H000000FF&", "outline_color": "&H00000000&", "font_name": "Impact", "font_size_short": 102}
+        return {
+            "primary_style": "&H0000D7FF",
+            "active_style": "&H0000FF7F",
+            "outline_style": "&H00000000",
+            "primary_tag": "&H00D7FF&",
+            "active_tag": "&H00FF7F&",
+            "font_name": "DejaVu Sans",
+            "font_size_short": 82,
+            "font_size_long": 58
+        }
+    elif any(k in text_sig for k in ['terror', 'misteri', 'oscuro', 'crimen', 'miedo', 'secreto', 'paranormal', 'interrogatorio']):
+        return {
+            "primary_style": "&H00FFFFFF",
+            "active_style": "&H000000FF",
+            "outline_style": "&H00000000",
+            "primary_tag": "&HFFFFFF&",
+            "active_tag": "&H0000FF&",
+            "font_name": "DejaVu Sans",
+            "font_size_short": 84,
+            "font_size_long": 60
+        }
     elif any(k in text_sig for k in ['tech', 'tecno', 'ia', 'futuro', 'ciencia', 'codigo', 'robot']):
-        return {"primary_color": "&H00FFFFFF&", "active_color": "&H00FFFF00&", "outline_color": "&H00111111&", "font_name": "Arial Black", "font_size_short": 94}
-    return {"primary_color": "&H00FFFFFF&", "active_color": "&H0000FFFF&", "outline_color": "&H00000000&", "font_name": "Arial Black", "font_size_short": 96}
+        return {
+            "primary_style": "&H00FFFFFF",
+            "active_style": "&H00FFFF00",
+            "outline_style": "&H00111111",
+            "primary_tag": "&HFFFFFF&",
+            "active_tag": "&HFFFF00&",
+            "font_name": "DejaVu Sans",
+            "font_size_short": 80,
+            "font_size_long": 56
+        }
+    return {
+        "primary_style": "&H00FFFFFF",
+        "active_style": "&H0000FFFF",
+        "outline_style": "&H00000000",
+        "primary_tag": "&HFFFFFF&",
+        "active_tag": "&H00FFFF&",
+        "font_name": "DejaVu Sans",
+        "font_size_short": 82,
+        "font_size_long": 58
+    }
 
 def sanitize_ass_word(word: str) -> str:
-    return re.sub(r"[\{\}\\]", "", word).upper()
+    cleaned = re.sub(r"[\{\}\\\r\n]", "", word).strip().upper()
+    return cleaned if cleaned else "..."
 
 def build_viral_ass_subtitles(words_timed: list[dict], ass_path: str, w: int, h: int, is_short: bool, total_duration: float, channel_name: str = "", topic: str = ""):
     profile = get_channel_subtitle_profile(channel_name, topic)
-    font_size = profile["font_size_short"] if is_short else 68
-    margin_v = 440 if is_short else 95
+    font_size = profile["font_size_short"] if is_short else profile["font_size_long"]
+    margin_v = 420 if is_short else 90
     group_size = 3 if is_short else 5
 
     ass_header = f"""[Script Info]
@@ -370,7 +428,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ViralSub,{profile["font_name"]},{font_size},{profile["primary_color"]},{profile["active_color"]},{profile["outline_color"]},&H80000000,-1,0,0,0,100,100,1,0,1,7,4,2,40,40,{margin_v},1
+Style: ViralSub,{profile["font_name"]},{font_size},{profile["primary_style"]},{profile["active_style"]},{profile["outline_style"]},&H80000000,-1,0,0,0,100,100,1,0,1,6,3,2,40,40,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -383,13 +441,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             continue
 
         for active_idx, active_word in enumerate(chunk):
-            start_sec = active_word["start"]
+            start_sec = float(active_word["start"])
             if active_idx + 1 < len(chunk):
-                end_sec = max(active_word["end"], chunk[active_idx + 1]["start"])
+                end_sec = max(float(active_word["end"]), float(chunk[active_idx + 1]["start"]))
             elif i + group_size < len(words_timed):
-                end_sec = max(active_word["end"], min(words_timed[i + group_size]["start"], active_word["end"] + 0.35))
+                end_sec = max(float(active_word["end"]), min(float(words_timed[i + group_size]["start"]), float(active_word["end"]) + 0.35))
             else:
-                end_sec = min(total_duration, max(active_word["end"] + 0.25, active_word["end"]))
+                end_sec = min(total_duration, max(float(active_word["end"]) + 0.25, float(active_word["end"])))
 
             if end_sec <= start_sec:
                 end_sec = start_sec + 0.15
@@ -398,7 +456,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             for idx_in_chunk, item in enumerate(chunk):
                 clean_w = sanitize_ass_word(item["word"])
                 if idx_in_chunk == active_idx:
-                    styled_tokens.append(r"{\c" + profile["active_color"] + "}" + clean_w + r"{\c" + profile["primary_color"] + "}")
+                    styled_tokens.append(f"{{\\c{profile['active_tag']}}}{clean_w}{{\\c{profile['primary_tag']}}}")
                 else:
                     styled_tokens.append(clean_w)
 
@@ -422,34 +480,36 @@ async def prepare_background_music(duration: float, bgm_path: str):
                 if res.status_code == 200 and len(res.content) > 20000:
                     with open(raw_bgm, "wb") as f:
                         f.write(res.content)
-                    subprocess.run([
-                        "ffmpeg", "-y", "-stream_loop", "-1", "-t", str(duration),
+                    run_ffmpeg([
+                        "ffmpeg", "-y", "-stream_loop", "-1", "-t", f"{duration:.2f}",
                         "-i", raw_bgm, "-c:a", "pcm_s16le", "-ar", "24000", "-ac", "1", bgm_path
-                    ], check=True)
+                    ], "Preparación BGM")
                     return
             except Exception:
                 pass
 
-    subprocess.run([
+    run_ffmpeg([
         "ffmpeg", "-y", "-f", "lavfi",
-        "-i", f"aevalsrc='0.12*sin(2*PI*130.81*t)+0.08*sin(2*PI*196*t)':s=24000:d={duration}",
-        "-af", "lowpass=f=600", "-c:a", "pcm_s16le", bgm_path
-    ], check=True)
+        "-i", f"aevalsrc='0.12*sin(2*PI*130.81*t)+0.08*sin(2*PI*196*t)':s=24000:d={duration:.2f}",
+        "-af", "lowpass=f=600", "-c:a", "pcm_s16le", "-ar", "24000", "-ac", "1", bgm_path
+    ], "Generación BGM Sintético")
 
 def postproducir_video_maestro(input_video: str, output_video: str, is_short: bool = True, trim_silences: bool = True):
     w, h = (1080, 1920) if is_short else (1920, 1080)
-    filtro_audio = "silenceremove=stop_periods=-1:stop_duration=0.35:stop_threshold=-48dB,loudnorm=I=-16:TP=-1.5:LRA=11,acompressor" if trim_silences else "loudnorm=I=-16:TP=-1.5:LRA=11"
+    filtro_audio = (
+        "silenceremove=stop_periods=-1:stop_duration=0.35:stop_threshold=-48dB,loudnorm=I=-16:TP=-1.5:LRA=11,acompressor"
+        if trim_silences else "loudnorm=I=-16:TP=-1.5:LRA=11"
+    )
     filtro_video = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps=30"
 
-    cmd = [
+    run_ffmpeg([
         "ffmpeg", "-y", "-i", input_video,
         "-af", filtro_audio,
         "-vf", filtro_video,
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
         "-c:a", "aac", "-b:a", "192k",
         output_video
-    ]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    ], "Masterización Final")
     return output_video
 
 async def edit_uploaded_raw_video(video_url: str, prefix: str, is_short: bool = True) -> str:
@@ -475,22 +535,26 @@ async def render_video_with_real_clips(prefix: str, script_text: str, search_ter
     raw_output = f"output/{prefix}_raw.mp4"
     final_video = f"output/{prefix}_final.mp4"
 
+    # 1. Voz Kokoro pre-limpiada
     await generate_voice_kokoro(script_text, voice_path, is_short=is_short)
-    total_duration = get_audio_duration(voice_path)
+    total_duration = max(1.0, get_audio_duration(voice_path))
 
+    # 2. Subtítulos .ASS con Pop y color adaptativo al canal
     words_timed = await get_word_timestamps(voice_path, script_text, total_duration)
     build_viral_ass_subtitles(words_timed, ass_path, w, h, is_short, total_duration, CHANNEL_NAME, RAW_TOPIC)
 
+    # 3. Mezcla de voz + BGM en formato PCM WAV nativo (Evita el error exit status 234)
     await prepare_background_music(total_duration, bgm_path)
     fade_start = max(0.0, total_duration - 2.0)
 
-    subprocess.run([
+    run_ffmpeg([
         "ffmpeg", "-y", "-i", voice_path, "-i", bgm_path,
         "-filter_complex",
-        f"[0:a]volume=1.15[v];[1:a]volume=0.09,afade=t=out:st={fade_start}:d=2[b];[v][b]amix=inputs=2:duration=first[aout]",
-        "-map", "[aout]", "-c:a", "aac", "-b:a", "192k", mixed_audio
-    ], check=True)
+        f"[0:a]volume=1.15[v];[1:a]volume=0.09,afade=t=out:st={fade_start:.2f}:d=2[b];[v][b]amix=inputs=2:duration=first[aout]",
+        "-map", "[aout]", "-c:a", "pcm_s16le", "-ar", "24000", "-ac", "1", mixed_audio
+    ], "Mezcla Master WAV")
 
+    # 4. Descarga y normalización estricta de clips B-Roll
     target_cut_sec = 2.8 if is_short else 3.8
     num_cuts = max(int(np.ceil(total_duration / target_cut_sec)), len(search_terms), 4)
     clip_duration = total_duration / num_cuts
@@ -521,34 +585,38 @@ async def render_video_with_real_clips(prefix: str, script_text: str, search_ter
                             raw_vid = f"output/{prefix}_source_{i}.mp4"
                             with open(raw_vid, "wb") as f:
                                 f.write(vid_data.content)
-                            subprocess.run([
-                                "ffmpeg", "-y", "-stream_loop", "-1", "-t", str(clip_duration), "-i", raw_vid,
-                                "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},eq=contrast=1.06:saturation=1.12,unsharp=5:5:0.8:3:3:0.4,fps=30",
+                            run_ffmpeg([
+                                "ffmpeg", "-y", "-stream_loop", "-1", "-t", f"{clip_duration:.2f}", "-i", raw_vid,
+                                "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,eq=contrast=1.06:saturation=1.12,unsharp=5:5:0.8:3:3:0.4,fps=30",
+                                "-r", "30", "-vsync", "cfr", "-video_track_timescale", "15360",
                                 "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", clip_file
-                            ], check=True)
+                            ], f"Normalización Clip {i}")
                             got_clip = True
                 except Exception:
                     pass
 
             if not got_clip:
-                subprocess.run([
-                    "ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=0x0f172a:s={w}x{h}:d={clip_duration}:r=30",
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", clip_file
-                ], check=True)
+                run_ffmpeg([
+                    "ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=0x0f172a:s={w}x{h}:d={clip_duration:.2f}:r=30",
+                    "-vf", "setsar=1", "-r", "30", "-vsync", "cfr", "-video_track_timescale", "15360",
+                    "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", clip_file
+                ], f"Clip Fallback {i}")
 
-            clip_paths.append(str(os.path.abspath(clip_file)))
+            clip_paths.append(os.path.abspath(clip_file).replace("\\", "/"))
 
     concat_file = f"output/{prefix}_concat.txt"
-    with open(concat_file, "w") as f:
+    with open(concat_file, "w", encoding="utf-8") as f:
         for cp in clip_paths:
             f.write(f"file '{cp}'\n")
 
-    subprocess.run([
+    # 5. Renderizado de concatenación + quemado de subtítulos .ASS
+    ass_filter_path = ass_path.replace("\\", "/").replace(":", "\\:")
+    run_ffmpeg([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
-        "-i", mixed_audio, "-vf", f"ass={ass_path}",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+        "-i", mixed_audio, "-vf", f"ass={ass_filter_path}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "20",
         "-c:a", "aac", "-b:a", "192k", "-shortest", raw_output
-    ], check=True)
+    ], "Concatenación y Subtítulos ASS")
 
     postproducir_video_maestro(raw_output, final_video, is_short=is_short, trim_silences=False)
     return final_video
@@ -556,7 +624,10 @@ async def render_video_with_real_clips(prefix: str, script_text: str, search_ter
 def upload_youtube_rotated(video_path: str, title: str, description: str, tags: list[str], is_short: bool = True, publish_at: str = None) -> str:
     channel_tokens = sorted(glob.glob(f"tokens/{CHANNEL_ID}_token_*.json")) or sorted(glob.glob("tokens/*.json"))
     if not channel_tokens:
-        raise RuntimeError(f"No se encontraron tokens para el canal '{CHANNEL_NAME}' ({CHANNEL_ID}). Conéctalo desde el botón OAuth de Telegram.")
+        raise RuntimeError(
+            f"No se encontraron tokens para el canal '{CHANNEL_NAME}' ({CHANNEL_ID}). "
+            "Inicia la orden desde el bot de Telegram (o PAULA) para inyectar el token desde Cloudflare KV."
+        )
 
     status_body = {"selfDeclaredMadeForKids": False}
     if publish_at:
