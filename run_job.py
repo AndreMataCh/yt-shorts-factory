@@ -14,11 +14,17 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
+def clean_secret(val: str) -> str:
+    if not val:
+        return ""
+    # Elimina comillas, saltos de línea y espacios accidentales al copiar/pegar en GitHub Secrets
+    return re.sub(r'[\r\n\t"\'\s]+', '', val)
+
 # === VARIABLES DE ENTORNO Y PAYLOAD DE PAULA / WORKER ===
-BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
-GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
-PEXELS_API_KEY = (os.getenv("PEXELS_API_KEY") or "").strip()
+BOT_TOKEN = clean_secret(os.getenv("TELEGRAM_BOT_TOKEN") or "")
+GROQ_API_KEY = clean_secret(os.getenv("GROQ_API_KEY") or "")
+GEMINI_API_KEY = clean_secret(os.getenv("GEMINI_API_KEY") or "")
+PEXELS_API_KEY = clean_secret(os.getenv("PEXELS_API_KEY") or "")
 
 CHANNEL_ID = (os.getenv("CHANNEL_ID") or "ch1").strip().lower()
 CHANNEL_NAME = (os.getenv("CHANNEL_NAME") or CHANNEL_ID.upper()).strip()
@@ -34,7 +40,7 @@ MONETIZATION_URL = (os.getenv("MONETIZATION_URL") or "").strip()
 CUSTOM_TITLE = (os.getenv("CUSTOM_TITLE") or "").strip()
 CUSTOM_DESCRIPTION = (os.getenv("CUSTOM_DESCRIPTION") or "").strip()
 SOURCE_VIDEO_URL = (os.getenv("SOURCE_VIDEO_URL") or "").strip()
-CHAT_ID = (os.getenv("CHAT_ID") or "").strip()
+CHAT_ID = clean_secret(os.getenv("CHAT_ID") or "")
 
 try:
     VIDEO_COUNT = max(1, min(int(re.sub(r"[^0-9]", "", RAW_COUNT) or "1"), 10))
@@ -80,11 +86,36 @@ def clean_llm_output(text: str) -> str:
 async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
     errors = []
 
-    if GEMINI_API_KEY:
-        for model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
-            async with httpx.AsyncClient(timeout=60.0, headers=BROWSER_HEADERS) as client:
+    # 1. GOOGLE GEMINI CON AUTO-DESCUBRIMIENTO DE MODELOS ACTIVOS
+    if GEMINI_API_KEY and GEMINI_API_KEY.startswith("AIza"):
+        gemini_headers = {
+            **BROWSER_HEADERS,
+            "x-goog-api-key": GEMINI_API_KEY,
+            "Content-Type": "application/json"
+        }
+        async with httpx.AsyncClient(timeout=60.0, headers=gemini_headers) as client:
+            models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest", "gemini-pro-latest"]
+            try:
+                list_res = await client.get("https://generativelanguage.googleapis.com/v1beta/models")
+                if list_res.status_code == 200:
+                    avail = [
+                        m["name"].replace("models/", "")
+                        for m in list_res.json().get("models", [])
+                        if "generateContent" in m.get("supportedGenerationMethods", [])
+                        and "gemini" in m.get("name", "")
+                        and "vision" not in m.get("name", "")
+                        and "embedding" not in m.get("name", "")
+                    ]
+                    # Priorizar modelos flash disponibles en la cuenta
+                    flash_First = sorted(avail, key=lambda x: (0 if "flash" in x else 1))
+                    if flash_First:
+                        models_to_try = flash_First[:4]
+            except Exception:
+                pass
+
+            for model in models_to_try:
                 try:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
                     res = await client.post(url, json={"contents": [{"parts": [{"text": prompt}]}]})
                     if res.status_code == 200:
                         candidates = res.json().get("candidates", [])
@@ -96,16 +127,37 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                     else:
                         errors.append(f"Gemini ({model}): HTTP {res.status_code}")
                 except Exception as e:
-                    errors.append(f"Gemini ({model}): {str(e)}")
+                    errors.append(f"Gemini ({model}): {str(e)[:60]}")
+    elif GEMINI_API_KEY:
+        errors.append("GEMINI_API_KEY inválida (no inicia con AIza)")
 
-    if GROQ_API_KEY:
-        headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-        for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+    # 2. GROQ CON AUTO-DESCUBRIMIENTO DE MODELOS ACTIVOS
+    if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
+        groq_headers = {
+            **BROWSER_HEADERS,
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        async with httpx.AsyncClient(timeout=60.0, headers=groq_headers) as client:
+            groq_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it"]
+            try:
+                m_res = await client.get("https://api.groq.com/openai/v1/models")
+                if m_res.status_code == 200:
+                    avail_g = [
+                        m["id"] for m in m_res.json().get("data", [])
+                        if "whisper" not in m["id"].lower() and "guard" not in m["id"].lower() and "tts" not in m["id"].lower()
+                    ]
+                    if avail_g:
+                        # Priorizar llama-3.3 o llama-3.1 si existen
+                        avail_g.sort(key=lambda x: (0 if "llama-3.3" in x else (1 if "llama" in x else 2)))
+                        groq_models = avail_g[:4]
+            except Exception:
+                pass
+
+            for model in groq_models:
                 try:
                     res = await client.post(
                         "https://api.groq.com/openai/v1/chat/completions",
-                        headers=headers,
                         json={
                             "model": model,
                             "messages": [{"role": "user", "content": prompt}],
@@ -121,34 +173,60 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                     else:
                         errors.append(f"Groq ({model}): HTTP {res.status_code}")
                 except Exception as e:
-                    errors.append(f"Groq ({model}): {str(e)}")
+                    errors.append(f"Groq ({model}): {str(e)[:60]}")
+    elif GROQ_API_KEY:
+        errors.append("GROQ_API_KEY inválida (no inicia con gsk_)")
 
+    # 3. RESPALDO GRATUITO OFICIAL 1: POLLINATIONS OPENAI ENDPOINT (/openai)
     async with httpx.AsyncClient(timeout=60.0, headers={**BROWSER_HEADERS, "Content-Type": "application/json"}, follow_redirects=True) as client:
         for poly_model in ["openai", "mistral", "llama"]:
             try:
                 res = await client.post(
-                    "https://text.pollinations.ai/",
-                    json={"messages": [{"role": "user", "content": prompt}], "model": poly_model, "jsonMode": False}
+                    "https://text.pollinations.ai/openai",
+                    json={
+                        "model": poly_model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.7
+                    }
                 )
-                if res.status_code == 200 and len(res.text.strip()) > 10:
-                    cleaned = clean_llm_output(res.text)
-                    if cleaned and "<!DOCTYPE html>" not in cleaned:
-                        return cleaned
+                if res.status_code == 200:
+                    data = res.json()
+                    if "choices" in data and len(data["choices"]) > 0:
+                        content = data["choices"][0].get("message", {}).get("content", "")
+                        cleaned = clean_llm_output(content)
+                        if cleaned:
+                            return cleaned
+                else:
+                    errors.append(f"Pollinations OpenAI ({poly_model}): HTTP {res.status_code}")
             except Exception as e:
-                errors.append(f"Pollinations POST ({poly_model}): {str(e)}")
+                errors.append(f"Pollinations OpenAI ({poly_model}): {str(e)[:60]}")
 
-    async with httpx.AsyncClient(timeout=45.0, headers=BROWSER_HEADERS, follow_redirects=True) as client:
+    # 4. RESPALDO GRATUITO 2: POLLINATIONS ROOT POST Y GET
+    async with httpx.AsyncClient(timeout=60.0, headers={**BROWSER_HEADERS, "Content-Type": "application/json"}, follow_redirects=True) as client:
         try:
-            encoded_p = urllib.parse.quote(prompt[:800])
-            res = await client.get(f"https://text.pollinations.ai/{encoded_p}")
-            if res.status_code == 200 and "<!DOCTYPE html>" not in res.text:
+            res = await client.post(
+                "https://text.pollinations.ai/",
+                json={"messages": [{"role": "user", "content": prompt}], "model": "openai"}
+            )
+            if res.status_code == 200 and len(res.text.strip()) > 10 and "<!DOCTYPE" not in res.text:
                 cleaned = clean_llm_output(res.text)
                 if cleaned:
                     return cleaned
         except Exception as e:
-            errors.append(f"Pollinations GET: {str(e)}")
+            errors.append(f"Pollinations Root: {str(e)[:60]}")
 
-    raise RuntimeError(f"Falla de LLMs: {' | '.join(errors)[:300]}")
+    async with httpx.AsyncClient(timeout=45.0, headers=BROWSER_HEADERS, follow_redirects=True) as client:
+        try:
+            encoded_p = urllib.parse.quote(prompt[:600])
+            res = await client.get(f"https://text.pollinations.ai/{encoded_p}")
+            if res.status_code == 200 and len(res.text.strip()) > 5 and "<!DOCTYPE" not in res.text:
+                cleaned = clean_llm_output(res.text)
+                if cleaned:
+                    return cleaned
+        except Exception as e:
+            errors.append(f"Pollinations GET: {str(e)[:60]}")
+
+    raise RuntimeError(f"Falla de LLMs: {' | '.join(errors)[:350]}")
 
 async def generate_long_plan(topic: str) -> dict:
     script_prompt = (
@@ -426,7 +504,6 @@ async def main():
     try:
         await send_telegram(f"🚀 <b>Iniciando Fábrica Pro v4.0</b>\n📺 <b>Canal:</b> {CHANNEL_NAME}\n📌 <b>Tarea:</b> {RAW_TOPIC}")
 
-        # Si el usuario o PAULA envió un video ya grabado para postproducción profesional
         if SOURCE_VIDEO_URL:
             is_short_mode = (MODE_CHOICE == "1")
             edited_vid = await edit_uploaded_raw_video(SOURCE_VIDEO_URL, "raw_edit", is_short=is_short_mode)
