@@ -179,9 +179,22 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
 
     raise RuntimeError(f"Falla total de LLMs: {' | '.join(errors)[:350]}")
 
+def get_seo_context() -> str:
+    if os.path.exists("seo_context.md"):
+        try:
+            with open("seo_context.md", "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    return f"\n\nContexto actual de tendencias web analizadas:\n{content[:1500]}\n"
+        except Exception:
+            pass
+    return ""
+
 async def generate_long_plan(topic: str) -> dict:
+    seo_intel = get_seo_context()
     script_prompt = (
         f"Escribe un guion documental fascinante y dinámico en español neutro de unas 350 a 450 palabras sobre: '{topic}'. "
+        f"{seo_intel}"
         "Estructura: Gancho impactante en los primeros 3 segundos, desarrollo con alto ritmo narrativo y conclusión memorable. "
         "REGLAS: Devuelve ÚNICAMENTE el texto hablado. Sin asteriscos, sin títulos, sin emojis."
     )
@@ -208,9 +221,11 @@ async def generate_long_plan(topic: str) -> dict:
     }
 
 async def generate_teaser_short_plan(topic: str, long_title: str = "", long_url: str = "") -> dict:
+    seo_intel = get_seo_context()
     cta_line = "Descubre el video completo en el enlace de la descripción." if long_url else "Suscríbete para descubrir más secretos como este."
     script_prompt = (
         f"Escribe un guion de YouTube Short ultradinámico de 30 segundos sobre '{topic}'. "
+        f"{seo_intel}"
         f"Empieza con un gancho agresivo y termina diciendo: '{cta_line}' "
         "REGLAS: Devuelve ÚNICAMENTE el texto hablado en español neutro, sin asteriscos ni emojis."
     )
@@ -268,7 +283,6 @@ async def generate_voice_kokoro(script_text: str, audio_path: str, is_short: boo
     complete_audio = np.concatenate(audio_chunks)
     sf.write(raw_voice, complete_audio, 24000)
 
-    # Pre-limpieza de silencios muertos
     filtro_voz = (
         "silenceremove=start_periods=1:start_silence=0.05:start_threshold=-48dB:"
         "stop_periods=-1:stop_duration=0.22:stop_threshold=-48dB,"
@@ -306,7 +320,6 @@ async def get_word_timestamps(audio_path: str, script_text: str, total_duration:
         except Exception:
             pass
 
-    # Fallback ponderado
     raw_words = [w.strip() for w in script_text.split() if w.strip()]
     if not raw_words:
         return [{"word": "VIDEO", "start": 0.0, "end": total_duration}]
@@ -572,7 +585,7 @@ def upload_youtube_rotated(video_path: str, title: str, description: str, tags: 
 
 async def main():
     try:
-        await send_telegram(f"🚀 <b>Iniciando Fábrica Pro v4.0 (Subtítulos Pop Dinámicos)</b>\n📺 <b>Canal:</b> {CHANNEL_NAME}\n📌 <b>Tema:</b> {RAW_TOPIC}")
+        await send_telegram(f"🚀 <b>Iniciando Fábrica Pro v4.0 (SEO Curado + Subtítulos Pop)</b>\n📺 <b>Canal:</b> {CHANNEL_NAME}\n📌 <b>Tema:</b> {RAW_TOPIC}")
 
         if SOURCE_VIDEO_URL:
             is_short_mode = (MODE_CHOICE == "1")
