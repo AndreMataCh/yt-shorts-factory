@@ -1,4 +1,4 @@
-name: YouTube Shorts Factory
+name: YouTube Factory Pipeline
 
 on:
   repository_dispatch:
@@ -6,44 +6,43 @@ on:
   workflow_dispatch:
 
 jobs:
-  produce-and-upload:
-    runs-on: ubuntu-24.04
+  build-videos:
+    runs-on: ubuntu-latest
     steps:
-      - name: Descargar código
+      - name: Checkout código de la fábrica
         uses: actions/checkout@v4
 
-      - name: Configurar Python 3.11
+      - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Instalar FFmpeg, eSpeak y dependencias de Kokoro
+      - name: Instalar dependencias del sistema (FFmpeg, etc.)
         run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg fonts-liberation espeak-ng
-          pip install --upgrade pip
-          pip install httpx kokoro soundfile numpy google-api-python-client google-auth-oauthlib google-auth-httplib2
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libasound2-dev
 
-      - name: Cargar Tokens Multi-Canal de YouTube desde Secrets
+      - name: Instalar dependencias de la Fábrica + Kokoro / Whisper / Crawl4AI
+        run: |
+          python -m pip install --upgrade pip
+          pip install httpx numpy soundfile google-api-python-client google-auth-oauthlib kokoro sounddevice crawl4ai playwright requests
+          playwright install chromium
+
+      # --- PASO OPCIONAL DE CURACIÓN SEO ---
+      - name: 🕵️‍♂️ Scrapear competencia con Crawl4AI (Opcional)
+        continue-on-error: true
         env:
-          YT_TOKEN_1: ${{ secrets.YT_TOKEN_1 }}
-          YT_TOKEN_2: ${{ secrets.YT_TOKEN_2 }}
-          YT_CH1_TOKEN_1: ${{ secrets.YT_CH1_TOKEN_1 }}
-          YT_CH2_TOKEN_1: ${{ secrets.YT_CH2_TOKEN_1 }}
-          YT_CH2_TOKEN_2: ${{ secrets.YT_CH2_TOKEN_2 }}
-          YT_CH3_TOKEN_1: ${{ secrets.YT_CH3_TOKEN_1 }}
+          CHANNEL_NAME: ${{ github.event.client_payload.channel_name }}
+          TOPIC: ${{ github.event.client_payload.topic }}
         run: |
-          mkdir -p tokens output
-          # Canal 1 (compatible con tus secretos actuales YT_TOKEN_1 y YT_TOKEN_2)
-          if [ -n "$YT_TOKEN_1" ]; then echo "$YT_TOKEN_1" > tokens/ch1_token_1.json; fi
-          if [ -n "$YT_TOKEN_2" ]; then echo "$YT_TOKEN_2" > tokens/ch1_token_2.json; fi
-          if [ -n "$YT_CH1_TOKEN_1" ]; then echo "$YT_CH1_TOKEN_1" > tokens/ch1_token_3.json; fi
-          # Canal 2
-          if [ -n "$YT_CH2_TOKEN_1" ]; then echo "$YT_CH2_TOKEN_1" > tokens/ch2_token_1.json; fi
-          if [ -n "$YT_CH2_TOKEN_2" ]; then echo "$YT_CH2_TOKEN_2" > tokens/ch2_token_2.json; fi
-          # Canal 3
-          if [ -n "$YT_CH3_TOKEN_1" ]; then echo "$YT_CH3_TOKEN_1" > tokens/ch3_token_1.json; fi
+          if [ -f "seo_curator.py" ]; then
+            python seo_curator.py
+          else
+            echo "seo_curator.py no encontrado, omitiendo paso opcional de scraping."
+          fi
 
-      - name: Ejecutar Fábrica Pro
+      # --- PASO PRINCIPAL DE LA FÁBRICA ---
+      - name: 🎬 Generar Guiones, Audio Kokoro, Subtítulos Pop y Subir a YouTube
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -62,4 +61,5 @@ jobs:
           CUSTOM_DESCRIPTION: ${{ github.event.client_payload.custom_description }}
           SOURCE_VIDEO_URL: ${{ github.event.client_payload.source_video_url }}
           CHAT_ID: ${{ github.event.client_payload.chat_id }}
-        run: python3 run_job.py
+        run: |
+          python3 run_job.py
