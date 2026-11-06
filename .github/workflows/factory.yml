@@ -22,10 +22,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg libasound2-dev
 
-      - name: Instalar dependencias de la Fábrica + Kokoro / Whisper / Crawl4AI
+      - name: Instalar dependencias de la Fábrica + Kokoro / Whisper / Crawl4AI / Gradio
         run: |
           python -m pip install --upgrade pip
-          pip install httpx numpy soundfile google-api-python-client google-auth-oauthlib kokoro sounddevice crawl4ai playwright requests
+          pip install httpx numpy soundfile google-api-python-client google-auth-oauthlib kokoro sounddevice crawl4ai playwright requests gradio_client
           playwright install chromium
 
       # --- PASO OPCIONAL DE CURACIÓN SEO ---
@@ -40,8 +40,7 @@ jobs:
           else
             echo "seo_curator.py no encontrado, omitiendo paso opcional de scraping."
           fi
-
-      # --- PASO PRINCIPAL DE LA FÁBRICA ---
+            # --- PASO PRINCIPAL DE LA FÁBRICA ---
       - name: 🎬 Generar Guiones, Audio Kokoro, Subtítulos Pop y Subir a YouTube
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
