@@ -1,4 +1,4 @@
-name: YouTube Factory Pipeline
+name: YT Shorts & Long Video Factory
 
 on:
   repository_dispatch:
@@ -6,59 +6,60 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-videos:
+  build_and_publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+
     steps:
-      - name: Checkout código de la fábrica
+      - name: Descargar repositorio
         uses: actions/checkout@v4
 
-      - name: Configurar Python
+      - name: Configurar Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Instalar dependencias del sistema (FFmpeg, etc.)
+      - name: Instalar FFmpeg y Fuentes del Sistema
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg libasound2-dev
+          sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-liberation
 
-      - name: Instalar dependencias de la Fábrica + Kokoro / Whisper / Crawl4AI / Gradio
+      - name: Instalar dependencias de la Fábrica (Kokoro + Whisper + Crawl4AI + Gradio)
         run: |
           python -m pip install --upgrade pip
           pip install httpx numpy soundfile google-api-python-client google-auth-oauthlib kokoro sounddevice crawl4ai playwright requests gradio_client
           playwright install chromium
 
-      # --- PASO OPCIONAL DE CURACIÓN SEO ---
-      - name: 🕵️‍♂️ Scrapear competencia con Crawl4AI (Opcional)
+      - name: 🔍 Inteligencia Web SEO (Crawl4AI)
         continue-on-error: true
         env:
-          CHANNEL_NAME: ${{ github.event.client_payload.channel_name }}
-          TOPIC: ${{ github.event.client_payload.topic }}
+          TOPIC: ${{ github.event.client_payload.topic || 'Tecnología y Misterios' }}
+          GEMINI_API_KEY: ${{ github.event.client_payload.gemini_api_key || secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ github.event.client_payload.groq_api_key || secrets.GROQ_API_KEY }}
         run: |
           if [ -f "seo_curator.py" ]; then
             python seo_curator.py
-          else
-            echo "seo_curator.py no encontrado, omitiendo paso opcional de scraping."
           fi
-            # --- PASO PRINCIPAL DE LA FÁBRICA ---
-      - name: 🎬 Generar Guiones, Audio Kokoro, Subtítulos Pop y Subir a YouTube
+
+      - name: 🎬 Renderizar Video Pro v5.5 y Publicar en YouTube
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-          CHANNEL_ID: ${{ github.event.client_payload.channel_id }}
-          CHANNEL_NAME: ${{ github.event.client_payload.channel_name }}
-          CHANNEL_TOKEN_JSON: ${{ github.event.client_payload.channel_token_json }}
-          TOPIC: ${{ github.event.client_payload.topic }}
-          VISUAL_STYLE: ${{ github.event.client_payload.visual_style }}
-          VOICE_STYLE: ${{ github.event.client_payload.voice_style }}
-          VIDEO_COUNT: ${{ github.event.client_payload.video_count }}
-          MODE: ${{ github.event.client_payload.mode }}
-          MONETIZATION_URL: ${{ github.event.client_payload.monetization_url }}
-          CUSTOM_TITLE: ${{ github.event.client_payload.custom_title }}
-          CUSTOM_DESCRIPTION: ${{ github.event.client_payload.custom_description }}
-          SOURCE_VIDEO_URL: ${{ github.event.client_payload.source_video_url }}
-          CHAT_ID: ${{ github.event.client_payload.chat_id }}
-        run: |
-          python3 run_job.py
+          TELEGRAM_BOT_TOKEN: ${{ github.event.client_payload.telegram_bot_token || secrets.TELEGRAM_BOT_TOKEN }}
+          GEMINI_API_KEY: ${{ github.event.client_payload.gemini_api_key || secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ github.event.client_payload.groq_api_key || secrets.GROQ_API_KEY }}
+          PEXELS_API_KEY: ${{ github.event.client_payload.pexels_api_key || secrets.PEXELS_API_KEY }}
+          HF_TOKEN: ${{ github.event.client_payload.hf_token || secrets.HF_TOKEN }}
+          CHANNEL_ID: ${{ github.event.client_payload.channel_id || 'ch1' }}
+          CHANNEL_NAME: ${{ github.event.client_payload.channel_name || 'Canal Principal' }}
+          CHANNEL_TOKEN_JSON: ${{ github.event.client_payload.channel_token_json || '' }}
+          TOPIC: ${{ github.event.client_payload.topic || 'Los secretos mejor guardados de la tecnología' }}
+          CUSTOM_TITLE: ${{ github.event.client_payload.custom_title || '' }}
+          CUSTOM_DESCRIPTION: ${{ github.event.client_payload.custom_description || '' }}
+          VISUAL_STYLE: ${{ github.event.client_payload.visual_style || '1' }}
+          VOICE_STYLE: ${{ github.event.client_payload.voice_style || '1' }}
+          VIDEO_COUNT: ${{ github.event.client_payload.video_count || '1' }}
+          MODE: ${{ github.event.client_payload.mode || '3' }}
+          MONETIZATION_URL: ${{ github.event.client_payload.monetization_url || '' }}
+          SOURCE_VIDEO_URL: ${{ github.event.client_payload.source_video_url || '' }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id || secrets.ALLOWED_CHAT_ID }}
+        run: python run_job.py
