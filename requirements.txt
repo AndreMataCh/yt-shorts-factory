@@ -1,0 +1,11 @@
+httpx
+numpy
+soundfile
+google-api-python-client
+google-auth-oauthlib
+kokoro
+sounddevice
+crawl4ai
+playwright
+requests
+gradio_client
