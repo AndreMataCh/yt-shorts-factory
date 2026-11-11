@@ -25,41 +25,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-liberation
 
-      - name: Instalar dependencias de la Fábrica (Kokoro + Whisper + Crawl4AI + Gradio)
+      - name: Instalar dependencias de la Fábrica
         run: |
           python -m pip install --upgrade pip
           pip install httpx numpy soundfile google-api-python-client google-auth-oauthlib kokoro sounddevice crawl4ai playwright requests gradio_client
           playwright install chromium
 
-      - name: 🔍 Inteligencia Web SEO (Crawl4AI)
-        continue-on-error: true
+      - name: 🎬 Renderizar Video Pro y Publicar
         env:
-          TOPIC: ${{ github.event.client_payload.topic || 'Tecnología y Misterios' }}
-          GEMINI_API_KEY: ${{ github.event.client_payload.gemini_api_key || secrets.GEMINI_API_KEY }}
-          GROQ_API_KEY: ${{ github.event.client_payload.groq_api_key || secrets.GROQ_API_KEY }}
-        run: |
-          if [ -f "seo_curator.py" ]; then
-            python seo_curator.py
-          fi
-
-      - name: 🎬 Renderizar Video Pro v5.5 y Publicar en YouTube
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ github.event.client_payload.telegram_bot_token || secrets.TELEGRAM_BOT_TOKEN }}
-          GEMINI_API_KEY: ${{ github.event.client_payload.gemini_api_key || secrets.GEMINI_API_KEY }}
-          GROQ_API_KEY: ${{ github.event.client_payload.groq_api_key || secrets.GROQ_API_KEY }}
-          PEXELS_API_KEY: ${{ github.event.client_payload.pexels_api_key || secrets.PEXELS_API_KEY }}
-          HF_TOKEN: ${{ github.event.client_payload.hf_token || secrets.HF_TOKEN }}
+          BUNDLE_JSON: ${{ github.event.client_payload.bundle_json || '' }}
           CHANNEL_ID: ${{ github.event.client_payload.channel_id || 'ch1' }}
           CHANNEL_NAME: ${{ github.event.client_payload.channel_name || 'Canal Principal' }}
           CHANNEL_TOKEN_JSON: ${{ github.event.client_payload.channel_token_json || '' }}
-          TOPIC: ${{ github.event.client_payload.topic || 'Los secretos mejor guardados de la tecnología' }}
-          CUSTOM_TITLE: ${{ github.event.client_payload.custom_title || '' }}
-          CUSTOM_DESCRIPTION: ${{ github.event.client_payload.custom_description || '' }}
+          TOPIC: ${{ github.event.client_payload.topic || 'Tecnología' }}
           VISUAL_STYLE: ${{ github.event.client_payload.visual_style || '1' }}
           VOICE_STYLE: ${{ github.event.client_payload.voice_style || '1' }}
           VIDEO_COUNT: ${{ github.event.client_payload.video_count || '1' }}
           MODE: ${{ github.event.client_payload.mode || '3' }}
-          MONETIZATION_URL: ${{ github.event.client_payload.monetization_url || '' }}
-          SOURCE_VIDEO_URL: ${{ github.event.client_payload.source_video_url || '' }}
-          CHAT_ID: ${{ github.event.client_payload.chat_id || secrets.ALLOWED_CHAT_ID }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id || '' }}
         run: python run_job.py
