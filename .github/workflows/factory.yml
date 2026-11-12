@@ -11,25 +11,12 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - name: ⚡ Notificar Arranque de Máquina a Telegram (Instant UX)
+      - name: ⚡ Notificar Arranque de Máquina a Telegram (Sin IndentationError)
         continue-on-error: true
         env:
           BUNDLE_JSON: ${{ github.event.client_payload.bundle_json || '' }}
         run: |
-          python3 -c '
-          import os, json, urllib.request
-          b = json.loads(os.getenv("BUNDLE_JSON") or "{}")
-          tok = b.get("telegram_bot_token", "")
-          cid = b.get("chat_id", "")
-          mid = b.get("status_msg_id", "")
-          ch = b.get("channel_name", "Canal")
-          top = b.get("topic", "")
-          if tok and cid and mid:
-              txt = f"🎬 <b>Fábrica en Ejecución — {ch}</b>\n🟩🟩🟩🟩🟩⬜⬜⬜⬜⬜ <b>50%</b>\n\n📌 <b>Tema:</b> {top}\n⚡ <b>Estado actual:</b> Máquina Ubuntu activa en GitHub Actions ⚙️\n<i>Instalando FFmpeg, Kokoro-82M y Crawl4AI...</i>"
-              data = json.dumps({"chat_id": int(cid), "message_id": int(mid), "text": txt, "parse_mode": "HTML"}).encode()
-              req = urllib.request.Request(f"https://api.telegram.org/bot{tok}/editMessageText", data=data, headers={"Content-Type": "application/json"})
-              urllib.request.urlopen(req, timeout=10)
-          '
+          python3 -c 'import os, json, urllib.request; b = json.loads(os.getenv("BUNDLE_JSON") or "{}"); tok, cid, mid, ch, top = b.get("telegram_bot_token",""), b.get("chat_id",""), b.get("status_msg_id",""), b.get("channel_name","Canal"), b.get("topic",""); req = urllib.request.Request(f"https://api.telegram.org/bot{tok}/editMessageText", data=json.dumps({"chat_id": int(cid), "message_id": int(mid), "text": f"🎬 <b>Fábrica en Ejecución — {ch}</b>\n🟩🟩🟩🟩🟩⬜⬜⬜⬜⬜ <b>50%</b>\n\n📌 <b>Tema:</b> {top}\n⚡ <b>Estado actual:</b> Máquina Ubuntu activa en GitHub Actions ⚙️\n<i>Instalando FFmpeg, Kokoro-82M y Crawl4AI...</i>", "parse_mode": "HTML"}).encode(), headers={"Content-Type": "application/json"}) if (tok and cid and mid) else None; urllib.request.urlopen(req, timeout=10) if req else None'
 
       - name: Descargar repositorio
         uses: actions/checkout@v4
@@ -70,8 +57,8 @@ jobs:
           CHANNEL_NAME: ${{ github.event.client_payload.channel_name || 'Canal Principal' }}
           CHANNEL_TOKEN_JSON: ${{ github.event.client_payload.channel_token_json || '' }}
           TOPIC: ${{ github.event.client_payload.topic || 'Tecnología y Misterios' }}
-          VISUAL_STYLE: ${{ github.event.client_payload.visual_style || '1' }}
-          VOICE_STYLE: ${{ github.event.client_payload.voice_style || '1' }}
+          VISUAL_STYLE: ${{ github.event.client_payload.visual_style || '2' }}
+          VOICE_STYLE: ${{ github.event.client_payload.voice_style || '3' }}
           VIDEO_COUNT: ${{ github.event.client_payload.video_count || '1' }}
           MODE: ${{ github.event.client_payload.mode || '3' }}
           CHAT_ID: ${{ github.event.client_payload.chat_id || secrets.ALLOWED_CHAT_ID }}
