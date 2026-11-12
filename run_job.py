@@ -198,7 +198,7 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
     if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
         groq_headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         async with httpx.AsyncClient(timeout=60.0, headers=groq_headers) as client:
-            for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
+            for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "meta-llama/llama-3.3-70b-instruct"]:
                 try:
                     res = await client.post(
                         "https://api.groq.com/openai/v1/chat/completions",
