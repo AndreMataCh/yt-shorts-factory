@@ -25,7 +25,7 @@ def clean_secret(val: str) -> str:
         return ""
     return re.sub(r'[\r\n\t"\'\s]+', '', str(val))
 
-# === DESEMPAQUETADO AUTOMÁTICO DE BUNDLE_JSON (FIX LÍMITE 10 PROPIEDADES GITHUB) ===
+# === DESEMPAQUETADO AUTOMÁTICO DE BUNDLE_JSON ===
 RAW_BUNDLE = (os.getenv("BUNDLE_JSON") or "").strip()
 BUNDLE = {}
 if RAW_BUNDLE:
@@ -97,9 +97,6 @@ def run_ffmpeg(cmd: list[str], step_desc: str = "FFmpeg"):
         raise RuntimeError(f"Fallo en {step_desc} (Exit {res.returncode}): {tail_err[-250:]}")
     return res
 
-# =========================================================================
-# TELEMETRÍA EN TIEMPO REAL EN TELEGRAM (SIN SILENCIOS)
-# =========================================================================
 async def send_telegram(text: str):
     print(text)
     if not BOT_TOKEN or not CHAT_ID:
@@ -148,7 +145,6 @@ async def update_live_progress(percent: int, stage: str, detail: str = ""):
             except Exception as e:
                 print(f"Aviso editMessageText: {e}")
 
-        # Si no había STATUS_MSG_ID previo, creamos uno y lo guardamos para las siguientes etapas
         try:
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
             r = await client.post(url, json={
@@ -164,9 +160,6 @@ async def update_live_progress(percent: int, stage: str, detail: str = ""):
         except Exception as e:
             print(f"Aviso creando panel de progreso: {e}")
 
-# =========================================================================
-# CEREBRO LLM MULTIMODELO CON FALLBACK AUTOMÁTICO
-# =========================================================================
 def clean_llm_output(text: str) -> str:
     if not text:
         return ""
@@ -196,10 +189,10 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                 except Exception as e:
                     errors.append(f"Gemini ({model}): {str(e)[:60]}")
 
-   if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
+    if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
         groq_headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         async with httpx.AsyncClient(timeout=60.0, headers=groq_headers) as client:
-            for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama3-70b-8192"]:
+            for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
                 try:
                     res = await client.post(
                         "https://api.groq.com/openai/v1/chat/completions",
@@ -210,8 +203,10 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                         cleaned = clean_llm_output(content)
                         if cleaned:
                             return cleaned
-                except Exception:
-                    pass
+                    else:
+                        errors.append(f"Groq ({model}): HTTP {res.status_code}")
+                except Exception as e:
+                    errors.append(f"Groq ({model}): {str(e)[:60]}")
 
     if OPENROUTER_API_KEY:
         try:
@@ -262,9 +257,6 @@ def get_seo_context() -> str:
             pass
     return ""
 
-# =========================================================================
-# PARSER DE GUIONES Y MARCADORES DE EFECTOS DE SONIDO (SFX)
-# =========================================================================
 def parse_script_and_sfx(raw_script: str) -> tuple[str, list[dict]]:
     pattern = re.compile(r"\[SFX:\s*(whoosh|impact|riser|glitch)\]", flags=re.IGNORECASE)
     tokens = raw_script.split()
@@ -378,9 +370,6 @@ def get_audio_duration(audio_path: str) -> float:
     ]).decode().strip()
     return float(out)
 
-# =========================================================================
-# PILAR 1: CLONACIÓN DE VOZ F5-TTS (HF SPACES) + RESPALDO KOKORO-82M
-# =========================================================================
 async def generate_voice_hybrid(script_text: str, audio_path: str, is_short: bool = True):
     raw_voice = f"{audio_path}_raw.wav"
     cloned_ok = False
@@ -394,7 +383,7 @@ async def generate_voice_hybrid(script_text: str, audio_path: str, is_short: boo
     if HAS_GRADIO and ref_audio:
         for space_id in ["jpgallegoar/Spanish-F5", "mrfakename/E2-F5-TTS"]:
             try:
-                print(f"🎙️ Clonando voz con F5-TTS ({space_id}) usando {ref_audio}...")
+                print(f"🎙️ Clonando voz con F5-TTS ({space_id})...")
                 client = GradioClient(space_id, hf_token=HF_TOKEN if HF_TOKEN else None)
                 res = await asyncio.to_thread(
                     client.predict,
@@ -413,7 +402,7 @@ async def generate_voice_hybrid(script_text: str, audio_path: str, is_short: boo
                     cloned_ok = True
                     break
             except Exception as e:
-                print(f"Aviso F5-TTS ({space_id}): {e} -> usando Kokoro-82M.")
+                print(f"Aviso F5-TTS ({space_id}): {e}")
 
     if not cloned_ok:
         voice_map = {"1": "em_alex", "2": "ef_dora", "3": "em_santa"}
@@ -438,9 +427,6 @@ async def generate_voice_hybrid(script_text: str, audio_path: str, is_short: boo
         "-c:a", "pcm_s16le", "-ar", "24000", "-ac", "1", audio_path
     ], "Limpieza y masterización de voz")
 
-# =========================================================================
-# PILAR 2: BANCO DE SONIDOS SINTETIZADOS (DSP) Y MEZCLA MULTICAPA
-# =========================================================================
 def ensure_sfx_bank() -> dict[str, str]:
     os.makedirs("output/sfx", exist_ok=True)
     bank = {
@@ -487,9 +473,6 @@ def resolve_sfx_timestamps(sfx_cues: list[dict], words_timed: list[dict], total_
             resolved.append({"type": cue["type"], "time": t_sec})
     return resolved[:10]
 
-# =========================================================================
-# PILAR 3: AVATAR PARLANTE (LIVEPORTRAIT / PIP DINÁMICO)
-# =========================================================================
 async def prepare_channel_avatar(prefix: str, voice_path: str) -> str:
     avatar_candidates = [
         f"assets/avatars/{CHANNEL_ID}.png",
