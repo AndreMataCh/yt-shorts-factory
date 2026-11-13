@@ -8,25 +8,14 @@ import urllib.parse
 import httpx
 import numpy as np
 import soundfile as sf
-from kokoro import KPipeline
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from googleapiclient.errors import HttpError
-
-try:
-    from gradio_client import Client as GradioClient, handle_file
-    HAS_GRADIO = True
-except ImportError:
-    HAS_GRADIO = False
 
 def clean_secret(val: str) -> str:
-    """Sanitiza variables de entorno y secretos eliminando caracteres de control."""
+    """Sanitiza variables de entorno y secretos eliminando caracteres de control e imperfecciones."""
     if not val:
         return ""
     return re.sub(r'[\r\n\t"\'\s]+', '', str(val))
 
-# === CONFIGURACIÓN DE ENTORNO Y BUNDLE ===
+# === DESEMPAQUETADO TEMPRANO DE BUNDLE_JSON E INYECCIÓN DE HF_TOKEN ===
 RAW_BUNDLE = (os.getenv("BUNDLE_JSON") or "").strip()
 BUNDLE = {}
 if RAW_BUNDLE:
@@ -46,6 +35,23 @@ GEMINI_API_KEY = clean_secret(get_cfg("GEMINI_API_KEY", "gemini_api_key"))
 OPENROUTER_API_KEY = clean_secret(get_cfg("OPENROUTER_API_KEY", "openrouter_api_key"))
 PEXELS_API_KEY = clean_secret(get_cfg("PEXELS_API_KEY", "pexels_api_key"))
 HF_TOKEN = clean_secret(get_cfg("HF_TOKEN", "hf_token"))
+
+# Inyectar HF_TOKEN en el entorno del sistema ANTES de importar Kokoro / HuggingFace Hub
+if HF_TOKEN:
+    os.environ["HF_TOKEN"] = HF_TOKEN
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
+
+from kokoro import KPipeline
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
+
+try:
+    from gradio_client import Client as GradioClient, handle_file
+    HAS_GRADIO = True
+except ImportError:
+    HAS_GRADIO = False
 
 CHANNEL_ID = get_cfg("CHANNEL_ID", "channel_id", "ch1").lower()
 CHANNEL_NAME = get_cfg("CHANNEL_NAME", "channel_name", CHANNEL_ID.upper())
@@ -69,8 +75,15 @@ try:
 except ValueError:
     VIDEO_COUNT = 1
 
+# Cabeceras separadas: BROWSER_HEADERS para descargas multimedia y API_HEADERS limpias para REST APIs
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+}
+
+API_HEADERS = {
+    "User-Agent": "PAULA-Enterprise-Engine/7.2",
+    "Accept": "application/json",
+    "Content-Type": "application/json"
 }
 
 os.makedirs("tokens", exist_ok=True)
@@ -90,7 +103,7 @@ print("[Info] Inicializando motor neuronal base Kokoro-82M...")
 kokoro_pipeline = KPipeline(lang_code='e')
 
 def run_ffmpeg(cmd: list[str], step_desc: str = "FFmpeg") -> subprocess.CompletedProcess:
-    """Ejecuta comandos FFmpeg con control estricto de errores."""
+    """Ejecuta comandos del sistema FFmpeg con control estricto de errores."""
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if res.returncode != 0:
         err_msg = res.stderr.decode("utf-8", errors="ignore")
@@ -98,6 +111,23 @@ def run_ffmpeg(cmd: list[str], step_desc: str = "FFmpeg") -> subprocess.Complete
         print(f"[Error] Fallo en {step_desc} (Código {res.returncode}):\n{tail_err}")
         raise RuntimeError(f"Fallo crítico en {step_desc} (Exit {res.returncode}): {tail_err[-250:]}")
     return res
+
+async def send_telegram(text: str) -> None:
+    """Envía notificaciones estáticas a Telegram de forma asíncrona."""
+    print(text)
+    if not BOT_TOKEN or not CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            await client.post(url, json={
+                "chat_id": int(CHAT_ID),
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False
+            })
+        except Exception as e:
+            print(f"[Warning] No se pudo enviar notificación a Telegram: {e}")
 
 async def update_live_progress(percent: int, stage: str, detail: str = "") -> None:
     """Actualiza en tiempo real el panel de progreso dinámico en Telegram."""
@@ -148,21 +178,41 @@ async def update_live_progress(percent: int, stage: str, detail: str = "") -> No
             print(f"[Warning] No se pudo inicializar el panel de progreso: {e}")
 
 def clean_llm_output(text: str) -> str:
-    """Limpia etiquetas de pensamiento y formato de los LLMs."""
+    """Limpia etiquetas de pensamiento (<think>) y bloques residuales de los LLMs."""
     if not text:
         return ""
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL)
     return cleaned.strip()
 
+# =========================================================================
+# MOTOR LLM ENTERPRISE CON AUTODESCUBRIMIENTO DINÁMICO DE MODELOS
+# =========================================================================
 async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
-    """Motor LLM principal con tolerancia a fallos y respaldo actualizado."""
+    """
+    Orquestador multi-proveedor con autodescubrimiento dinámico de modelos en vivo.
+    Garantiza continuidad operativa incluso si un proveedor retira modelos.
+    """
     errors = []
 
+    # 1. Google Gemini API (con autodescubrimiento de modelos activos)
     if GEMINI_API_KEY and GEMINI_API_KEY.startswith("AIza"):
-        gemini_headers = {**BROWSER_HEADERS, "x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
-        async with httpx.AsyncClient(timeout=60.0, headers=gemini_headers) as client:
-            for model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]:
+        gemini_headers = {**API_HEADERS, "x-goog-api-key": GEMINI_API_KEY}
+        gemini_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-flash-latest"]
+        async with httpx.AsyncClient(timeout=45.0, headers=gemini_headers) as client:
+            try:
+                m_res = await client.get("https://generativelanguage.googleapis.com/v1beta/models")
+                if m_res.status_code == 200:
+                    for m_obj in m_res.json().get("models", []):
+                        m_name = m_obj.get("name", "").replace("models/", "")
+                        methods = m_obj.get("supportedGenerationMethods", [])
+                        if "generateContent" in methods and "flash" in m_name and "tts" not in m_name and "image" not in m_name:
+                            if m_name not in gemini_models:
+                                gemini_models.append(m_name)
+            except Exception:
+                pass
+
+            for model in gemini_models[:5]:
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
                     res = await client.post(url, json={"contents": [{"parts": [{"text": prompt}]}]})
@@ -176,16 +226,49 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                     else:
                         errors.append(f"Gemini ({model}): HTTP {res.status_code}")
                 except Exception as e:
-                    errors.append(f"Gemini ({model}): {str(e)[:60]}")
+                    errors.append(f"Gemini ({model}): {str(e)[:45]}")
 
+    # 2. Groq Cloud API (con cabeceras limpias y autodescubrimiento en /openai/v1/models)
     if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
-        groq_headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-        async with httpx.AsyncClient(timeout=60.0, headers=groq_headers) as client:
-            for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-120b", "openai/gpt-oss-20b"]:
+        groq_headers = {
+            **API_HEADERS,
+            "Authorization": f"Bearer {GROQ_API_KEY}"
+        }
+        groq_models = [
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+            "qwen/qwen3-32b",
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+            "gemma2-9b-it"
+        ]
+        async with httpx.AsyncClient(timeout=45.0, headers=groq_headers) as client:
+            try:
+                m_res = await client.get("https://api.groq.com/openai/v1/models")
+                if m_res.status_code == 200:
+                    live_models = [
+                        m.get("id", "")
+                        for m in m_res.json().get("data", [])
+                        if m.get("id") and not any(x in m.get("id", "").lower() for x in ["whisper", "guard", "tts", "embed", "vision", "audio", "playai"])
+                    ]
+                    if live_models:
+                        ordered = [m for m in groq_models if m in live_models]
+                        for lm in live_models:
+                            if lm not in ordered:
+                                ordered.append(lm)
+                        groq_models = ordered
+            except Exception as e:
+                print(f"[Warning] Autodescubrimiento Groq: {e}")
+
+            for model in groq_models[:6]:
                 try:
                     res = await client.post(
                         "https://api.groq.com/openai/v1/chat/completions",
-                        json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.7, "max_tokens": max_tokens}
+                        json={
+                            "model": model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.7,
+                            "max_tokens": max_tokens
+                        }
                     )
                     if res.status_code == 200:
                         content = res.json()["choices"][0]["message"].get("content") or ""
@@ -195,58 +278,95 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                     else:
                         errors.append(f"Groq ({model}): HTTP {res.status_code}")
                 except Exception as e:
-                    errors.append(f"Groq ({model}): {str(e)[:60]}")
+                    errors.append(f"Groq ({model}): {str(e)[:45]}")
 
+    # 3. OpenRouter API (con enrutador dinámico openrouter/auto y modelos gratuitos)
     if OPENROUTER_API_KEY:
-        try:
-            async with httpx.AsyncClient(
-                timeout=60.0,
-                headers={**BROWSER_HEADERS, "Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-            ) as client:
-                res = await client.post("https://openrouter.ai/api/v1/chat/completions", json={
-                    "model": "meta-llama/llama-3.3-70b-instruct:free",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.7
-                })
-                if res.status_code == 200:
-                    content = res.json()["choices"][0]["message"].get("content", "")
-                    cleaned = clean_llm_output(content)
-                    if cleaned:
-                        return cleaned
-        except Exception as e:
-            errors.append(f"OpenRouter: {str(e)[:60]}")
-
-    async with httpx.AsyncClient(timeout=60.0, headers={**BROWSER_HEADERS, "Content-Type": "application/json"}, follow_redirects=True) as client:
-        for poly_model in ["openai", "mistral"]:
-            try:
-                res = await client.post(
-                    "https://text.pollinations.ai/openai",
-                    json={"model": poly_model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.7}
-                )
-                if res.status_code == 200:
-                    data = res.json()
-                    if "choices" in data and len(data["choices"]) > 0:
-                        content = data["choices"][0].get("message", {}).get("content", "")
+        or_headers = {**API_HEADERS, "Authorization": f"Bearer {OPENROUTER_API_KEY}"}
+        async with httpx.AsyncClient(timeout=45.0, headers=or_headers) as client:
+            for or_model in ["openrouter/auto", "meta-llama/llama-3.3-70b-instruct:free", "google/gemini-2.0-flash-exp:free"]:
+                try:
+                    res = await client.post("https://openrouter.ai/api/v1/chat/completions", json={
+                        "model": or_model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.7
+                    })
+                    if res.status_code == 200:
+                        content = res.json().get("choices", [{}])[0].get("message", {}).get("content", "")
                         cleaned = clean_llm_output(content)
                         if cleaned:
                             return cleaned
-            except Exception as e:
-                errors.append(f"Pollinations ({poly_model}): {str(e)[:60]}")
+                    else:
+                        errors.append(f"OpenRouter ({or_model}): HTTP {res.status_code}")
+                except Exception as e:
+                    errors.append(f"OpenRouter: {str(e)[:45]}")
 
-    raise RuntimeError(f"Falla total de LLMs disponibles: {' | '.join(errors)[:350]}")
+    # 4. Pollinations AI Multi-Endpoint Fallback (JSON + Raw Text)
+    async with httpx.AsyncClient(timeout=45.0, headers=API_HEADERS, follow_redirects=True) as client:
+        for poly_url in ["https://text.pollinations.ai/openai", "https://text.pollinations.ai/"]:
+            for poly_model in ["openai", "mistral"]:
+                try:
+                    res = await client.post(
+                        poly_url,
+                        json={"model": poly_model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.7}
+                    )
+                    if res.status_code == 200:
+                        raw_txt = res.text.strip()
+                        try:
+                            data = res.json()
+                            if "choices" in data and len(data["choices"]) > 0:
+                                content = data["choices"][0].get("message", {}).get("content", "")
+                                cleaned = clean_llm_output(content)
+                                if cleaned:
+                                    return cleaned
+                        except Exception:
+                            cleaned = clean_llm_output(raw_txt)
+                            if len(cleaned) > 15:
+                                return cleaned
+                except Exception as e:
+                    errors.append(f"Pollinations ({poly_model}): {str(e)[:40]}")
+
+    # 5. Síntesis Determinista de Emergencia (Garantiza 100% Uptime Operativo)
+    print(f"[Warning] Todos los proveedores LLM remotos fallaron ({' | '.join(errors)[:250]}). Activando motor determinista local.")
+    return build_deterministic_fallback_response(prompt)
+
+def build_deterministic_fallback_response(prompt: str) -> str:
+    """Garantiza que la fábrica jamás se detenga incluso ante caídas globales de APIs de IA."""
+    p_low = prompt.lower()
+    if "comma-separated" in p_low:
+        return (
+            "cinematic dark room dramatic lighting, high tech holographic interface closeup, "
+            "mysterious figure analyzing data screens, futuristic neural network glowing nodes, "
+            "aerial view modern metropolis night, intense interrogation spotlight shadow, "
+            "digital security breach red alert, ancient secret manuscript macro shot, "
+            "hyperrealistic laboratory experiment, dramatic reveal camera zoom"
+        )
+    if "título" in p_low or "titulo" in p_low:
+        return f"La Verdad Oculta sobre {RAW_TOPIC[:42]}"
+    if "punto y coma" in p_low:
+        return f"{RAW_TOPIC} Caso 1; {RAW_TOPIC} Caso 2; {RAW_TOPIC} Caso 3"
+    return (
+        f"[SFX: impact] Lo que estás a punto de descubrir sobre {RAW_TOPIC} cambiará por completo tu perspectiva. "
+        f"[SFX: whoosh] Durante años, los expertos más destacados de {CHANNEL_NAME} analizaron cada detalle detrás de este fenómeno sin encontrar una respuesta simple. "
+        f"[SFX: riser] Sin embargo, cuando observamos las pruebas ocultas y los patrones que se repiten en los casos más recientes, emerge una verdad fascinante. "
+        f"[SFX: glitch] La clave no está en lo que parece evidente a simple vista, sino en el mecanismo silencioso que opera detrás de escena. "
+        f"[SFX: impact] Descarga la guía oficial y descubre el análisis completo en el enlace de la descripción."
+    )
 
 def get_seo_context() -> str:
+    """Extrae contexto analítico del curador web previo (Crawl4AI)."""
     if os.path.exists("seo_context.md"):
         try:
             with open("seo_context.md", "r", encoding="utf-8") as f:
                 content = f.read().strip()
                 if content:
-                    return f"\n\nContexto analítico de tendencias:\n{content[:1500]}\n"
+                    return f"\n\nContexto competitivo extraído de la web en tiempo real:\n{content[:1500]}\n"
         except Exception:
             pass
     return ""
 
 def parse_script_and_sfx(raw_script: str) -> tuple[str, list[dict]]:
+    """Parsea el guion extrayendo marcadores de efectos de sonido inmersivos."""
     pattern = re.compile(r"\[SFX:\s*(whoosh|impact|riser|glitch)\]", flags=re.IGNORECASE)
     tokens = raw_script.split()
     clean_words = []
@@ -272,53 +392,62 @@ def parse_script_and_sfx(raw_script: str) -> tuple[str, list[dict]]:
 
     return " ".join(clean_words), sfx_cues
 
+# =========================================================================
+# INGENIERÍA DE GUIONES CON RETENCIÓN ALGORÍTMICA (VENTAJA COMPETITIVA)
+# =========================================================================
 async def generate_long_plan(topic: str) -> dict:
+    """Genera guion documental aplicando Pattern Interrupts y Open Loops cada 15 segundos."""
     seo_intel = get_seo_context()
     script_prompt = (
-        f"Escribe un guion documental fascinante y dinámico en español neutro de unas 350 a 450 palabras sobre: '{topic}'. "
+        f"Eres el guionista principal del canal '{CHANNEL_NAME}'. Escribe un guion documental hipnótico en español neutro de 380 a 460 palabras sobre: '{topic}'. "
         f"{seo_intel}"
-        "Inserta entre 5 y 8 marcadores de efectos de sonido con el formato exacto [SFX: impact], [SFX: whoosh], [SFX: riser] o [SFX: glitch] en momentos clave. "
-        "REGLAS: Devuelve ÚNICAMENTE el texto hablado con sus etiquetas [SFX: ...]. Sin asteriscos, sin títulos, sin emojis."
+        "ESTRUCTURA DE ALTA RETENCIÓN OBLIGATORIA:\n"
+        "1. Segundos 0-5: Gancho de contradicción o pregunta imposible de ignorar (empieza con [SFX: impact]).\n"
+        "2. Cada 60 palabras abre un nuevo bucle de misterio (Open Loop) antes de cerrar el anterior.\n"
+        "3. Inserta entre 6 y 8 marcadores [SFX: impact], [SFX: whoosh], [SFX: riser] o [SFX: glitch] en las revelaciones clave.\n"
+        "4. En el último párrafo invita sutilmente a descargar el dossier/plantilla oficial en la descripción.\n"
+        "REGLA ESTRICTA: Devuelve ÚNICAMENTE las palabras que dirá el narrador con sus etiquetas [SFX: ...]. Sin títulos, sin asteriscos, sin notas de cámara."
     )
     raw_script = await ask_llm(script_prompt, max_tokens=1400)
     clean_script, sfx_cues = parse_script_and_sfx(raw_script)
 
-    title = CUSTOM_TITLE or (await ask_llm(f"Crea un título magnético de YouTube (máx 65 caracteres) sobre '{topic}'. SOLO el título sin comillas.", max_tokens=150)).replace('"', '').splitlines()[0].strip()[:75]
+    title = CUSTOM_TITLE or (await ask_llm(f"Crea un título magnético de alto CTR en YouTube (máx 62 caracteres, con brecha de curiosidad) sobre '{topic}'. SOLO el título sin comillas.", max_tokens=150)).replace('"', '').splitlines()[0].strip()[:75]
 
     terms_raw = await ask_llm(
-        f"Based on this narrative about '{topic}': '{clean_script[:500]}', provide 14 chronological visual scene prompts in English (4 to 7 words each, cinematic lighting, specific action). Return ONLY the 14 comma-separated prompts.",
+        f"Based on this documentary script about '{topic}': '{clean_script[:500]}', provide 14 chronological visual scene prompts in English (4 to 7 words each, hyperrealistic cinematic lighting, specific subject action). Return ONLY the 14 comma-separated prompts.",
         max_tokens=350
     )
     terms = [t.strip() for t in terms_raw.split(",") if t.strip()][:14]
     while len(terms) < 14:
         terms.append(f"cinematic dramatic scene {topic}")
 
-    monetization_block = f"\n\n🔥 Descarga la Plantilla / Recurso Oficial aquí:\n👉 {MONETIZATION_URL}" if MONETIZATION_URL else ""
+    monetization_block = f"\n\n🔥 Descarga la Plantilla / Dossier Oficial de este episodio aquí:\n👉 {MONETIZATION_URL}" if MONETIZATION_URL else ""
     base_desc = CUSTOM_DESCRIPTION or f"{title}\n\nExploramos a fondo: {topic}.\n\n{clean_script[:250]}..."
 
     return {
         "title": title,
-        "description": f"{base_desc}{monetization_block}\n\n#Documental #Tecnologia #Viral",
-        "tags": ["documental", "tecnologia", "ciencia", "viral"],
+        "description": f"{base_desc}{monetization_block}\n\n#Documental #{CHANNEL_NAME.replace(' ', '')} #Viral",
+        "tags": ["documental", "misterio", "tecnologia", "viral", CHANNEL_NAME.lower()],
         "script": clean_script,
         "sfx_cues": sfx_cues,
         "search_terms": terms
     }
 
 async def generate_teaser_short_plan(topic: str, long_title: str = "", long_url: str = "") -> dict:
+    """Genera YouTube Short con estructura de bucle infinito (Seamless Loop) y CTA al video largo/Gumroad."""
     seo_intel = get_seo_context()
     if MONETIZATION_URL:
-        cta_line = "Descarga la guía oficial y mira el video completo en la descripción."
+        cta_line = "Descarga la guía oficial y mira el video completo en el enlace de la descripción."
     elif long_url:
-        cta_line = "Descubre el caso completo en el enlace de la descripción."
+        cta_line = "Mira el caso completo en el enlace fijado en la descripción."
     else:
-        cta_line = "Suscríbete ahora para descubrir más secretos ocultos."
+        cta_line = "Suscríbete ahora porque la segunda parte te dejará sin palabras."
 
     script_prompt = (
-        f"Escribe un guion de YouTube Short ultradinámico de 30 segundos sobre '{topic}'. "
+        f"Escribe un guion de YouTube Short ultra-adictivo de 32 segundos (85-100 palabras) para el canal '{CHANNEL_NAME}' sobre '{topic}'. "
         f"{seo_intel}"
-        f"Inserta 4 marcadores [SFX: impact], [SFX: whoosh], [SFX: riser] o [SFX: glitch] y termina diciendo: '{cta_line}' "
-        "REGLAS: Devuelve ÚNICAMENTE el texto hablado en español neutro con las etiquetas [SFX: ...], sin asteriscos ni emojis."
+        f"La primera frase debe ser un gancho explosivo con [SFX: impact]. Usa ritmo trepidante, inserta 4 marcadores [SFX: impact], [SFX: whoosh], [SFX: riser] o [SFX: glitch] y cierra con: '{cta_line}' "
+        "REGLA ESTRICTA: Devuelve ÚNICAMENTE el texto hablado en español neutro con las etiquetas [SFX: ...], sin asteriscos ni emojis."
     )
     raw_script = await ask_llm(script_prompt, max_tokens=600)
     clean_script, sfx_cues = parse_script_and_sfx(raw_script)
@@ -326,25 +455,26 @@ async def generate_teaser_short_plan(topic: str, long_title: str = "", long_url:
     title = (await ask_llm(f"Crea un título corto y viral (máx 55 caracteres) para un Short sobre '{topic}'. SOLO el título sin comillas.", max_tokens=150)).replace('"', '').splitlines()[0].strip()[:65]
 
     terms_raw = await ask_llm(
-        f"Based on this short story about '{topic}': '{clean_script}', provide 10 chronological visual scene descriptions in English (4 to 7 words each). Return ONLY the 10 comma-separated descriptions.",
+        f"Based on this short story about '{topic}': '{clean_script}', provide 10 chronological visual scene descriptions in English (4 to 7 words each, intense cinematic atmosphere). Return ONLY the 10 comma-separated descriptions.",
         max_tokens=280
     )
     terms = [t.strip() for t in terms_raw.split(",") if t.strip()][:10]
     while len(terms) < 10:
         terms.append("cinematic suspenseful dark scene")
 
-    desc_link = f"\n\n🔗 Video completo: {long_url}" if long_url else ""
-    monetization_block = f"\n📦 Plantilla / Recurso Oficial: {MONETIZATION_URL}" if MONETIZATION_URL else ""
+    desc_link = f"\n\n🔗 Mira el Documental Completo aquí: {long_url}" if long_url else ""
+    monetization_block = f"\n📦 Plantilla / Dossier Oficial: {MONETIZATION_URL}" if MONETIZATION_URL else ""
     return {
         "title": title,
-        "description": f"{title}{desc_link}{monetization_block}\n\n#Shorts #Viral",
-        "tags": ["shorts", "viral", "documental"],
+        "description": f"{title}{desc_link}{monetization_block}\n\n#Shorts #Viral #{CHANNEL_NAME.replace(' ', '')}",
+        "tags": ["shorts", "viral", "documental", CHANNEL_NAME.lower()],
         "script": clean_script,
         "sfx_cues": sfx_cues,
         "search_terms": terms
     }
 
 def format_ass_time(seconds: float) -> str:
+    """Convierte marcas de tiempo en formato estándar de subtítulos ASS."""
     total_cs = int(round(max(0.0, float(seconds)) * 100))
     h = total_cs // 360000
     m = (total_cs % 360000) // 6000
@@ -353,6 +483,7 @@ def format_ass_time(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 def get_audio_duration(audio_path: str) -> float:
+    """Obtiene la duración exacta de un archivo de audio mediante ffprobe."""
     out = subprocess.check_output([
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1", audio_path
@@ -360,6 +491,7 @@ def get_audio_duration(audio_path: str) -> float:
     return float(out)
 
 async def generate_voice_hybrid(script_text: str, audio_path: str, is_short: bool = True) -> None:
+    """Genera locución neuronal con F5-TTS (Hugging Face Spaces) o respaldo Kokoro-82M."""
     raw_voice = f"{audio_path}_raw.wav"
     cloned_ok = False
 
@@ -417,6 +549,7 @@ async def generate_voice_hybrid(script_text: str, audio_path: str, is_short: boo
     ], "Limpieza y masterización de voz")
 
 def ensure_sfx_bank() -> dict[str, str]:
+    """Genera mediante DSP efectos de sonido profesionales (SFX) si no existen."""
     os.makedirs("output/sfx", exist_ok=True)
     bank = {
         "whoosh": "output/sfx/whoosh.wav",
@@ -452,6 +585,7 @@ def ensure_sfx_bank() -> dict[str, str]:
     return bank
 
 def resolve_sfx_timestamps(sfx_cues: list[dict], words_timed: list[dict], total_duration: float) -> list[dict]:
+    """Mapea marcas de efectos de sonido a tiempos absolutos en segundos."""
     resolved = []
     if not words_timed:
         return resolved
@@ -463,6 +597,7 @@ def resolve_sfx_timestamps(sfx_cues: list[dict], words_timed: list[dict], total_
     return resolved[:10]
 
 async def prepare_channel_avatar(prefix: str, voice_path: str) -> str:
+    """Prepara el avatar parlante (LivePortrait o PiP dinámico)."""
     avatar_candidates = [
         f"assets/avatars/{CHANNEL_ID}.png",
         "assets/avatars/default.png"
@@ -520,6 +655,7 @@ async def prepare_channel_avatar(prefix: str, voice_path: str) -> str:
     return avatar_vid
 
 async def get_word_timestamps(audio_path: str, script_text: str, total_duration: float) -> list[dict]:
+    """Alinea palabras con marcas de tiempo usando Whisper (Groq API) con respaldo inteligente."""
     if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
         try:
             async with httpx.AsyncClient(timeout=45.0) as client:
@@ -533,7 +669,10 @@ async def get_word_timestamps(audio_path: str, script_text: str, total_duration:
                     }
                     res = await client.post(
                         "https://api.groq.com/openai/v1/audio/transcriptions",
-                        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                        headers={
+                            "Authorization": f"Bearer {GROQ_API_KEY}",
+                            "User-Agent": "PAULA-Enterprise-Engine/7.2"
+                        },
                         files=files,
                         data=data
                     )
@@ -580,6 +719,7 @@ async def get_word_timestamps(audio_path: str, script_text: str, total_duration:
     return fallback_aligned
 
 def get_channel_subtitle_profile(channel_name: str, topic: str) -> dict:
+    """Define perfiles de diseño de subtítulos adaptados al nicho."""
     text_sig = (channel_name + " " + topic).lower()
     if any(k in text_sig for k in ['finan', 'cripto', 'dinero', 'banco', 'invers', 'negocio', 'bitcoin']):
         return {
@@ -604,6 +744,7 @@ def sanitize_ass_word(word: str) -> str:
     return cleaned if cleaned else "..."
 
 def build_viral_ass_subtitles(words_timed: list[dict], ass_path: str, w: int, h: int, is_short: bool, total_duration: float, channel_name: str = "", topic: str = "") -> None:
+    """Construye subtítulos dinámicos de alta retención en formato ASS."""
     profile = get_channel_subtitle_profile(channel_name, topic)
     font_size = profile["font_size_short"] if is_short else profile["font_size_long"]
     margin_v = 420 if is_short else 90
@@ -657,6 +798,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         f.writelines(lines)
 
 async def prepare_background_music(duration: float, bgm_path: str) -> None:
+    """Prepara la pista de música de fondo (BGM) con fundidos automáticos."""
     bgm_urls = [
         "https://cdn.pixabay.com/download/audio/2022/05/27/audio_1808fbf07a.mp3",
         "https://cdn.pixabay.com/download/audio/2022/01/18/audio_d0a13f69d2.mp3"
@@ -684,6 +826,7 @@ async def prepare_background_music(duration: float, bgm_path: str) -> None:
     ], "BGM Sintético")
 
 def mix_master_audio_with_sfx(voice_path: str, bgm_path: str, resolved_sfx: list[dict], sfx_bank: dict[str, str], total_duration: float, mixed_audio: str) -> None:
+    """Mezcla multicanal la locución, la música ambiental y los efectos de sonido."""
     fade_start = max(0.0, total_duration - 2.0)
     inputs = ["-i", voice_path, "-i", bgm_path]
     filter_parts = [
@@ -713,6 +856,7 @@ def mix_master_audio_with_sfx(voice_path: str, bgm_path: str, resolved_sfx: list
     ], "Mezcla Multicapa")
 
 def postproducir_video_maestro(input_video: str, output_video: str, is_short: bool = True, trim_silences: bool = True) -> str:
+    """Aplica masterización final de video y normalización de audio profesional."""
     w, h = (1080, 1920) if is_short else (1920, 1080)
     filtro_audio = (
         "silenceremove=stop_periods=-1:stop_duration=0.35:stop_threshold=-48dB,loudnorm=I=-16:TP=-1.5:LRA=11,acompressor"
@@ -731,6 +875,7 @@ def postproducir_video_maestro(input_video: str, output_video: str, is_short: bo
     return output_video
 
 async def edit_uploaded_raw_video(video_url: str, prefix: str, is_short: bool = True) -> str:
+    """Procesa videos externos o pregrabados."""
     os.makedirs("output", exist_ok=True)
     raw_input = f"output/{prefix}_uploaded_raw.mp4"
     final_video = f"output/{prefix}_edited_pro.mp4"
@@ -742,6 +887,7 @@ async def edit_uploaded_raw_video(video_url: str, prefix: str, is_short: bool = 
     return postproducir_video_maestro(raw_input, final_video, is_short=is_short, trim_silences=True)
 
 async def render_video_with_real_clips(prefix: str, script_text: str, search_terms: list[str], is_short: bool = True, sfx_cues: list[dict] = None) -> str:
+    """Ensambla el video completo combinando clips visuales, IA, locución y subtítulos dinámicos."""
     os.makedirs("output", exist_ok=True)
     w, h = (1080, 1920) if is_short else (1920, 1080)
     orientation = "portrait" if is_short else "landscape"
@@ -767,7 +913,7 @@ async def render_video_with_real_clips(prefix: str, script_text: str, search_ter
     await prepare_background_music(total_duration, bgm_path)
     mix_master_audio_with_sfx(voice_path, bgm_path, resolved_sfx, sfx_bank, total_duration, mixed_audio)
 
-    target_cut_sec = 2.8 if is_short else 3.8
+    target_cut_sec = 2.6 if is_short else 3.5
     num_cuts = max(int(np.ceil(total_duration / target_cut_sec)), len(search_terms), 4)
     clip_duration = total_duration / num_cuts
     frames_per_clip = max(30, int(round(clip_duration * 30)))
@@ -873,6 +1019,7 @@ async def render_video_with_real_clips(prefix: str, script_text: str, search_ter
     return final_video
 
 def upload_youtube_rotated(video_path: str, title: str, description: str, tags: list[str], is_short: bool = True) -> str:
+    """Sube el video renderizado a YouTube utilizando credenciales OAuth rotativas."""
     channel_tokens = sorted(glob.glob(f"tokens/{CHANNEL_ID}_token_*.json")) or sorted(glob.glob("tokens/*.json"))
     if not channel_tokens:
         raise RuntimeError(f"No se encontraron tokens OAuth para el canal '{CHANNEL_NAME}' ({CHANNEL_ID}).")
@@ -898,8 +1045,9 @@ def upload_youtube_rotated(video_path: str, title: str, description: str, tags: 
     raise RuntimeError("Cuota de subida agotada en los tokens de YouTube disponibles.")
 
 async def main() -> None:
+    """Función de orquestación principal de la fábrica."""
     try:
-        await update_live_progress(58, "Redactando guion documental y prompts visuales...", f"Canal: {CHANNEL_NAME} | Videos: {VIDEO_COUNT}")
+        await update_live_progress(58, "Redactando guion documental de alta retención y escenas...", f"Canal: {CHANNEL_NAME} | Videos: {VIDEO_COUNT}")
 
         if SOURCE_VIDEO_URL:
             is_short_mode = (MODE_CHOICE == "1")
