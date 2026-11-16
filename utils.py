@@ -79,3 +79,14 @@ async def retry_async(
 
     if last_exception:
         raise last_exception
+# utils.py (Añadir al final del archivo)
+
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+}
+
+API_HEADERS = {
+    "User-Agent": "PAULA-Enterprise-Engine/8.0",
+    "Accept": "application/json",
+    "Content-Type": "application/json"
+}
