@@ -51,6 +51,11 @@ OPENROUTER_API_KEY = clean_secret(get_cfg("OPENROUTER_API_KEY", "openrouter_api_
 PEXELS_API_KEY = clean_secret(get_cfg("PEXELS_API_KEY", "pexels_api_key"))
 HF_TOKEN = clean_secret(get_cfg("HF_TOKEN", "hf_token"))
 
+OMNICHANNEL_WEBHOOK_URL = get_cfg("OMNICHANNEL_WEBHOOK_URL", "omnichannel_webhook_url", "")
+TIKTOK_ACCESS_TOKEN = clean_secret(get_cfg("TIKTOK_ACCESS_TOKEN", "tiktok_access_token"))
+IG_ACCESS_TOKEN = clean_secret(get_cfg("IG_ACCESS_TOKEN", "ig_access_token"))
+X_BEARER_TOKEN = clean_secret(get_cfg("X_BEARER_TOKEN", "x_bearer_token"))
+
 if HF_TOKEN:
     os.environ["HF_TOKEN"] = HF_TOKEN
     os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
@@ -77,6 +82,15 @@ VOICE_STYLE = get_cfg("VOICE_STYLE", "voice_style", "3")
 RAW_COUNT = get_cfg("VIDEO_COUNT", "video_count", "1")
 MODE_CHOICE = get_cfg("MODE", "mode", "3")
 
+RAW_LONG_COUNT = get_cfg("LONG_COUNT", "long_count", "")
+RAW_SHORT_COUNT = get_cfg("SHORT_COUNT", "short_count", "")
+PUBLISH_AT_ISO = get_cfg("PUBLISH_AT_ISO", "publish_at_iso", "")
+PUBLISH_HOUR_ART = get_cfg("PUBLISH_HOUR_ART", "publish_hour_art", "NOW")
+
+PLATFORMS = BUNDLE.get("platforms") if isinstance(BUNDLE.get("platforms"), dict) else {
+    "youtube": True, "tiktok": True, "reels": True, "x": True
+}
+
 MONETIZATION_URL = get_cfg("MONETIZATION_URL", "monetization_url", "")
 CUSTOM_TITLE = get_cfg("CUSTOM_TITLE", "custom_title", "")
 CUSTOM_DESCRIPTION = get_cfg("CUSTOM_DESCRIPTION", "custom_description", "")
@@ -89,12 +103,31 @@ try:
 except ValueError:
     VIDEO_COUNT = 1
 
+try:
+    if RAW_LONG_COUNT != "":
+        LONG_COUNT = max(0, min(int(re.sub(r"[^0-9]", "", RAW_LONG_COUNT) or "0"), 5))
+    else:
+        LONG_COUNT = VIDEO_COUNT if MODE_CHOICE in ["2", "3"] else 0
+except ValueError:
+    LONG_COUNT = 1
+
+try:
+    if RAW_SHORT_COUNT != "":
+        SHORT_COUNT = max(0, min(int(re.sub(r"[^0-9]", "", RAW_SHORT_COUNT) or "0"), 10))
+    else:
+        SHORT_COUNT = VIDEO_COUNT if MODE_CHOICE in ["1", "3"] else 0
+except ValueError:
+    SHORT_COUNT = 1
+
+if LONG_COUNT == 0 and SHORT_COUNT == 0:
+    SHORT_COUNT = 1
+
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 }
 
 API_HEADERS = {
-    "User-Agent": "PAULA-Enterprise-Engine/7.3",
+    "User-Agent": "PAULA-Enterprise-Engine/8.0",
     "Accept": "application/json",
     "Content-Type": "application/json"
 }
@@ -117,7 +150,6 @@ kokoro_pipeline = KPipeline(lang_code='e')
 log("[Info] Motor Kokoro-82M cargado y listo.")
 
 def run_ffmpeg(cmd: list[str], step_desc: str = "FFmpeg", timeout_sec: int = 180) -> subprocess.CompletedProcess:
-    """Ejecuta comandos FFmpeg con timeout duro para evitar bloqueos infinitos en CI/CD."""
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_sec)
     except subprocess.TimeoutExpired:
@@ -131,7 +163,6 @@ def run_ffmpeg(cmd: list[str], step_desc: str = "FFmpeg", timeout_sec: int = 180
     return res
 
 async def send_telegram(text: str) -> None:
-    """Envía notificaciones estáticas a Telegram de forma asíncrona."""
     log(text)
     if not BOT_TOKEN or not CHAT_ID:
         return
@@ -148,7 +179,6 @@ async def send_telegram(text: str) -> None:
             log(f"[Warning] No se pudo enviar notificación a Telegram: {e}")
 
 async def update_live_progress(percent: int, stage: str, detail: str = "") -> None:
-    """Actualiza en tiempo real el panel de progreso dinámico en Telegram."""
     global STATUS_MSG_ID
     log(f"[{percent}%] {stage} - {detail}")
     if not BOT_TOKEN or not CHAT_ID:
@@ -156,10 +186,15 @@ async def update_live_progress(percent: int, stage: str, detail: str = "") -> No
 
     filled = max(0, min(10, round(percent / 10)))
     bar = "🟩" * filled + "⬜" * (10 - filled)
+    active_nets = [k.upper() for k, v in PLATFORMS.items() if v]
+    nets_str = " + ".join(active_nets) if active_nets else "YOUTUBE"
+
     text = (
-        f"🎬 <b>Fábrica en Ejecución — {CHANNEL_NAME}</b>\n"
+        f"🎬 <b>Fábrica Omnicanal — {CHANNEL_NAME}</b>\n"
         f"{bar} <b>{percent}%</b>\n\n"
         f"📌 <b>Tema:</b> {RAW_TOPIC}\n"
+        f"📦 <b>Cuota:</b> {LONG_COUNT} Largos + {SHORT_COUNT} Shorts | 🕒 <b>Hora Pub:</b> {PUBLISH_HOUR_ART}\n"
+        f"📱 <b>Redes:</b> {nets_str}\n"
         f"⚡ <b>Estado actual:</b> {stage}\n"
         f"<i>{detail}</i>"
     )
@@ -196,7 +231,6 @@ async def update_live_progress(percent: int, stage: str, detail: str = "") -> No
             log(f"[Warning] No se pudo inicializar el panel de progreso: {e}")
 
 def clean_llm_output(text: str) -> str:
-    """Limpia etiquetas de pensamiento (<think>) y bloques residuales de los LLMs."""
     if not text:
         return ""
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
@@ -209,7 +243,6 @@ def clean_llm_output(text: str) -> str:
 async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
     errors = []
 
-    # 1. Google Gemini API
     if GEMINI_API_KEY and GEMINI_API_KEY.startswith("AIza"):
         gemini_headers = {**API_HEADERS, "x-goog-api-key": GEMINI_API_KEY}
         gemini_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
@@ -231,7 +264,6 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                 except Exception as e:
                     errors.append(f"Gemini ({model}): {str(e)[:40]}")
 
-    # 2. Groq Cloud API (con autodescubrimiento rápido)
     if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
         groq_headers = {**API_HEADERS, "Authorization": f"Bearer {GROQ_API_KEY}"}
         groq_models = [
@@ -281,7 +313,6 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                 except Exception as e:
                     errors.append(f"Groq ({model}): {str(e)[:40]}")
 
-    # 3. OpenRouter API
     if OPENROUTER_API_KEY:
         or_headers = {**API_HEADERS, "Authorization": f"Bearer {OPENROUTER_API_KEY}"}
         async with httpx.AsyncClient(timeout=30.0, headers=or_headers) as client:
@@ -301,7 +332,6 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
                 except Exception as e:
                     errors.append(f"OpenRouter: {str(e)[:40]}")
 
-    # 4. Pollinations AI Fallback
     async with httpx.AsyncClient(timeout=25.0, headers=API_HEADERS, follow_redirects=True) as client:
         for poly_url in ["https://text.pollinations.ai/openai", "https://text.pollinations.ai/"]:
             try:
@@ -330,7 +360,6 @@ async def ask_llm(prompt: str, max_tokens: int = 1200) -> str:
     return build_deterministic_fallback_response(prompt)
 
 def build_deterministic_fallback_response(prompt: str) -> str:
-    """Garantiza que la fábrica jamás se detenga incluso ante caídas globales de APIs de IA."""
     p_low = prompt.lower()
     if "comma-separated" in p_low:
         return (
@@ -343,7 +372,7 @@ def build_deterministic_fallback_response(prompt: str) -> str:
     if "título" in p_low or "titulo" in p_low:
         return f"La Verdad Oculta sobre {RAW_TOPIC[:42]}"
     if "punto y coma" in p_low:
-        return f"{RAW_TOPIC} Caso 1; {RAW_TOPIC} Caso 2; {RAW_TOPIC} Caso 3"
+        return f"{RAW_TOPIC} Enfoque 1; {RAW_TOPIC} Enfoque 2; {RAW_TOPIC} Enfoque 3; {RAW_TOPIC} Enfoque 4; {RAW_TOPIC} Enfoque 5"
     return (
         f"[SFX: impact] Lo que estás a punto de descubrir sobre {RAW_TOPIC} cambiará por completo tu perspectiva. "
         f"[SFX: whoosh] Durante años, los especialistas más destacados de {CHANNEL_NAME} analizaron cada detalle detrás de este fenómeno sin encontrar una explicación sencilla. "
@@ -429,14 +458,14 @@ async def generate_long_plan(topic: str) -> dict:
 async def generate_teaser_short_plan(topic: str, long_title: str = "", long_url: str = "") -> dict:
     seo_intel = get_seo_context()
     if MONETIZATION_URL:
-        cta_line = "Descarga la guía oficial y mira el video completo en el enlace de la descripción."
+        cta_line = "Descarga la guía oficial y mira el análisis completo en el enlace del perfil."
     elif long_url:
         cta_line = "Mira el caso completo en el enlace fijado en la descripción."
     else:
-        cta_line = "Suscríbete ahora porque la segunda parte te dejará sin palabras."
+        cta_line = "Síguenos ahora porque la segunda parte te dejará sin palabras."
 
     script_prompt = (
-        f"Escribe un guion de YouTube Short ultra-adictivo de 30 segundos (75-90 palabras) para el canal '{CHANNEL_NAME}' sobre '{topic}'. "
+        f"Escribe un guion vertical ultra-adictivo de 30 segundos (75-90 palabras) optimizado para YouTube Shorts, TikTok e Instagram Reels del canal '{CHANNEL_NAME}' sobre '{topic}'. "
         f"{seo_intel}"
         f"La primera frase debe ser un gancho explosivo con [SFX: impact]. Usa ritmo trepidante, inserta 4 marcadores [SFX: impact], [SFX: whoosh], [SFX: riser] o [SFX: glitch] y cierra con: '{cta_line}' "
         "REGLA ESTRICTA: Devuelve ÚNICAMENTE el texto hablado en español neutro con las etiquetas [SFX: ...], sin asteriscos ni emojis."
@@ -444,7 +473,7 @@ async def generate_teaser_short_plan(topic: str, long_title: str = "", long_url:
     raw_script = await ask_llm(script_prompt, max_tokens=500)
     clean_script, sfx_cues = parse_script_and_sfx(raw_script)
 
-    title = (await ask_llm(f"Crea un título corto y viral (máx 55 caracteres) para un Short sobre '{topic}'. SOLO el título sin comillas.", max_tokens=150)).replace('"', '').splitlines()[0].strip()[:65]
+    title = (await ask_llm(f"Crea un título corto y viral (máx 55 caracteres) para Shorts/TikTok/Reels sobre '{topic}'. SOLO el título sin comillas.", max_tokens=150)).replace('"', '').splitlines()[0].strip()[:65]
 
     terms_raw = await ask_llm(
         f"Based on this short story about '{topic}': '{clean_script}', provide 8 chronological visual scene descriptions in English (4 to 7 words each, intense cinematic atmosphere). Return ONLY the 8 comma-separated descriptions.",
@@ -454,12 +483,17 @@ async def generate_teaser_short_plan(topic: str, long_title: str = "", long_url:
     while len(terms) < 8:
         terms.append("cinematic suspenseful dark scene")
 
+    x_post = (await ask_llm(f"Escribe un post viral e intrigante para X (Twitter) de máx 240 caracteres sobre '{topic}' con 2 hashtags. SOLO el texto.", max_tokens=140)).strip()[:260]
+
     desc_link = f"\n\n🔗 Mira el Documental Completo aquí: {long_url}" if long_url else ""
     monetization_block = f"\n📦 Plantilla / Dossier Oficial: {MONETIZATION_URL}" if MONETIZATION_URL else ""
     return {
         "title": title,
-        "description": f"{title}{desc_link}{monetization_block}\n\n#Shorts #Viral #{CHANNEL_NAME.replace(' ', '')}",
-        "tags": ["shorts", "viral", "documental", CHANNEL_NAME.lower()],
+        "description": f"{title}{desc_link}{monetization_block}\n\n#Shorts #TikTok #Reels #{CHANNEL_NAME.replace(' ', '')}",
+        "tiktok_caption": f"{title} 🔥 {MONETIZATION_URL} #fyp #parati #viral #{CHANNEL_NAME.replace(' ', '').lower()}",
+        "reels_caption": f"{title}\n.\n{MONETIZATION_URL}\n#reels #viral #documental",
+        "x_post": f"{x_post}\n{long_url or MONETIZATION_URL}".strip(),
+        "tags": ["shorts", "tiktok", "reels", "viral", CHANNEL_NAME.lower()],
         "script": clean_script,
         "sfx_cues": sfx_cues,
         "search_terms": terms
@@ -480,9 +514,6 @@ def get_audio_duration(audio_path: str) -> float:
     ]).decode().strip()
     return float(out)
 
-# =========================================================================
-# VOZ NEURONAL CON TIMEOUT ESTRICTO DE 18 SEGUNDOS EN GRADIO
-# =========================================================================
 def _sync_f5_infer(space_id: str, ref_audio: str, script_text: str) -> str:
     client = GradioClient(space_id, hf_token=HF_TOKEN if HF_TOKEN else None)
     res = client.predict(
@@ -594,9 +625,6 @@ def resolve_sfx_timestamps(sfx_cues: list[dict], words_timed: list[dict], total_
             resolved.append({"type": cue["type"], "time": t_sec})
     return resolved[:10]
 
-# =========================================================================
-# AVATAR PIP RÁPIDO CON TIMEOUT ESTRICTO DE 15 SEGUNDOS
-# =========================================================================
 async def prepare_channel_avatar(prefix: str, voice_path: str) -> str:
     avatar_candidates = [
         f"assets/avatars/{CHANNEL_ID}.png",
@@ -643,7 +671,7 @@ async def get_word_timestamps(audio_path: str, script_text: str, total_duration:
                         "https://api.groq.com/openai/v1/audio/transcriptions",
                         headers={
                             "Authorization": f"Bearer {GROQ_API_KEY}",
-                            "User-Agent": "PAULA-Enterprise-Engine/7.3"
+                            "User-Agent": "PAULA-Enterprise-Engine/8.0"
                         },
                         files=files,
                         data=data
@@ -853,9 +881,6 @@ async def edit_uploaded_raw_video(video_url: str, prefix: str, is_short: bool = 
             f.write(res.content)
     return postproducir_video_maestro(raw_input, final_video, is_short=is_short, trim_silences=True)
 
-# =========================================================================
-# GENERACIÓN CONCURRENTE DE CLIPS CON TIMEOUT ESTRICTO POR ESCENA
-# =========================================================================
 async def build_single_scene_clip(
     i: int,
     term: str,
@@ -948,7 +973,7 @@ async def render_video_with_real_clips(prefix: str, script_text: str, search_ter
     os.makedirs("output", exist_ok=True)
     w, h = (1080, 1920) if is_short else (1920, 1080)
     orientation = "portrait" if is_short else "landscape"
-    format_label = "Short 9:16" if is_short else "Documental 16:9"
+    format_label = "Short/Reels/TikTok 9:16" if is_short else "Documental 16:9"
 
     voice_path = f"output/{prefix}_voice.wav"
     bgm_path = f"output/{prefix}_bgm.wav"
@@ -1027,12 +1052,25 @@ async def render_video_with_real_clips(prefix: str, script_text: str, search_ter
     postproducir_video_maestro(raw_output, final_video, is_short=is_short, trim_silences=False)
     return final_video
 
+# =========================================================================
+# SUBIDA A YOUTUBE CON SOPORTE DE HORARIO PROGRAMADO (publishAt ISO)
+# =========================================================================
 def upload_youtube_rotated(video_path: str, title: str, description: str, tags: list[str], is_short: bool = True) -> str:
     channel_tokens = sorted(glob.glob(f"tokens/{CHANNEL_ID}_token_*.json")) or sorted(glob.glob("tokens/*.json"))
     if not channel_tokens:
         raise RuntimeError(f"No se encontraron tokens OAuth para el canal '{CHANNEL_NAME}' ({CHANNEL_ID}).")
 
-    status_body = {"selfDeclaredMadeForKids": False, "privacyStatus": "public"}
+    if PUBLISH_AT_ISO and PUBLISH_HOUR_ART != "NOW":
+        status_body = {
+            "selfDeclaredMadeForKids": False,
+            "privacyStatus": "private",
+            "publishAt": PUBLISH_AT_ISO
+        }
+    else:
+        status_body = {
+            "selfDeclaredMadeForKids": False,
+            "privacyStatus": "public"
+        }
 
     for token_path in channel_tokens:
         try:
@@ -1052,12 +1090,70 @@ def upload_youtube_rotated(video_path: str, title: str, description: str, tags: 
             raise e
     raise RuntimeError("Cuota de subida agotada en los tokens de YouTube disponibles.")
 
+# =========================================================================
+# DISTRIBUCIÓN OMNICANAL: TIKTOK, INSTAGRAM REELS Y X (TWITTER)
+# =========================================================================
+async def distribute_omnichannel_short(short_plan: dict, video_path: str, yt_short_url: str) -> list[str]:
+    results = []
+
+    # 1. X / Twitter API v2 o Intent Post
+    if PLATFORMS.get("x", True):
+        x_text = short_plan.get("x_post") or f"{short_plan['title']} {yt_short_url}"
+        if X_BEARER_TOKEN:
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    r = await client.post(
+                        "https://api.twitter.com/2/tweets",
+                        headers={"Authorization": f"Bearer {X_BEARER_TOKEN}", "Content-Type": "application/json"},
+                        json={"text": x_text[:275]}
+                    )
+                    if r.status_code in [200, 201]:
+                        tid = r.json().get("data", {}).get("id", "")
+                        results.append(f"🐦 <b>X (Publicado):</b> https://x.com/i/web/status/{tid}")
+                    else:
+                        results.append(f"🐦 <b>X (Copy Listo):</b> <code>{x_text[:110]}...</code>")
+            except Exception:
+                results.append(f"🐦 <b>X (Copy Listo):</b> <code>{x_text[:110]}...</code>")
+        else:
+            results.append(f"🐦 <b>X (Post Listo):</b> <code>{x_text[:110]}...</code>")
+
+    # 2. TikTok & Instagram Reels via Omnichannel Webhook o Kit de Publicación
+    if PLATFORMS.get("tiktok", True):
+        results.append(f"🎵 <b>TikTok 9:16:</b> Masterizado (Caption: <code>{short_plan.get('tiktok_caption', '')[:65]}...</code>)")
+
+    if PLATFORMS.get("reels", True):
+        results.append(f"📸 <b>IG Reels 9:16:</b> Masterizado (Caption: <code>{short_plan.get('reels_caption', '')[:65]}...</code>)")
+
+    if OMNICHANNEL_WEBHOOK_URL:
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                await client.post(OMNICHANNEL_WEBHOOK_URL, json={
+                    "channel_id": CHANNEL_ID,
+                    "channel_name": CHANNEL_NAME,
+                    "youtube_short_url": yt_short_url,
+                    "title": short_plan["title"],
+                    "tiktok_caption": short_plan.get("tiktok_caption", ""),
+                    "reels_caption": short_plan.get("reels_caption", ""),
+                    "x_post": short_plan.get("x_post", ""),
+                    "publish_at_iso": PUBLISH_AT_ISO,
+                    "monetization_url": MONETIZATION_URL
+                })
+                results.append("🔗 <b>Webhook Omnicanal:</b> Despachado OK (TikTok/Reels/X)")
+        except Exception as e:
+            log(f"[Warning] Webhook Omnicanal: {e}")
+
+    return results
+
 async def main() -> None:
     try:
-        await update_live_progress(58, "Redactando guion documental de alta retención y escenas...", f"Canal: {CHANNEL_NAME} | Videos: {VIDEO_COUNT}")
+        await update_live_progress(
+            58,
+            "Estructurando guiones de alta retención para Largos y Shorts...",
+            f"Canal: {CHANNEL_NAME} | {LONG_COUNT} Largos + {SHORT_COUNT} Shorts | Hora: {PUBLISH_HOUR_ART}"
+        )
 
         if SOURCE_VIDEO_URL:
-            is_short_mode = (MODE_CHOICE == "1")
+            is_short_mode = (SHORT_COUNT > 0 and LONG_COUNT == 0)
             edited_vid = await edit_uploaded_raw_video(SOURCE_VIDEO_URL, "raw_edit", is_short=is_short_mode)
             title = CUSTOM_TITLE or RAW_TOPIC[:80]
             desc = CUSTOM_DESCRIPTION or f"{title}\n\n{MONETIZATION_URL}"
@@ -1066,49 +1162,63 @@ async def main() -> None:
             await send_telegram(f"✅ <b>Video Pregrabado Masterizado y Publicado:</b>\n🔗 {vid_url}")
             return
 
-        if VIDEO_COUNT > 1:
-            variation_prompt = f"Para el nicho '{RAW_TOPIC}', genera {VIDEO_COUNT} subtemas virales. Devuelve ÚNICAMENTE los títulos separados por punto y coma (;)."
-            raw_subtopics = await ask_llm(variation_prompt, max_tokens=300)
-            subtopics = [s.strip() for s in raw_subtopics.split(";") if s.strip()][:VIDEO_COUNT]
-            while len(subtopics) < VIDEO_COUNT:
+        max_needed = max(LONG_COUNT, SHORT_COUNT, 1)
+        if max_needed > 1:
+            variation_prompt = f"Para el tema '{RAW_TOPIC}', genera {max_needed} ángulos virales distintos. Devuelve ÚNICAMENTE los títulos separados por punto y coma (;)."
+            raw_subtopics = await ask_llm(variation_prompt, max_tokens=350)
+            subtopics = [s.strip() for s in raw_subtopics.split(";") if s.strip()][:max_needed]
+            while len(subtopics) < max_needed:
                 subtopics.append(f"{RAW_TOPIC} - Parte {len(subtopics)+1}")
         else:
             subtopics = [RAW_TOPIC]
 
         published_summary = []
+        primary_long_url = ""
+        primary_long_title = RAW_TOPIC
 
-        for idx, topic in enumerate(subtopics, start=1):
-            long_url = ""
-            long_title = topic
-
-            if MODE_CHOICE in ["2", "3"]:
-                await update_live_progress(62, f"Diseñando Video Largo ({idx}/{len(subtopics)})...", topic)
-                long_plan = await generate_long_plan(topic)
-                long_title = long_plan["title"]
-                long_vid = await render_video_with_real_clips(
-                    f"long_{idx}", long_plan["script"], long_plan["search_terms"],
-                    is_short=False, sfx_cues=long_plan.get("sfx_cues", [])
-                )
-                await update_live_progress(96, f"Subiendo Video Largo ({idx}/{len(subtopics)}) a YouTube...", long_plan["title"])
+        # 1. PRODUCCIÓN DE VIDEOS LARGOS (16:9) SEGÚN LONG_COUNT
+        for idx in range(1, LONG_COUNT + 1):
+            topic = subtopics[(idx - 1) % len(subtopics)]
+            await update_live_progress(62, f"Diseñando Video Largo ({idx}/{LONG_COUNT})...", topic)
+            long_plan = await generate_long_plan(topic)
+            long_vid = await render_video_with_real_clips(
+                f"long_{idx}", long_plan["script"], long_plan["search_terms"],
+                is_short=False, sfx_cues=long_plan.get("sfx_cues", [])
+            )
+            if PLATFORMS.get("youtube", True):
+                await update_live_progress(94, f"Subiendo Video Largo ({idx}/{LONG_COUNT}) a YouTube...", long_plan["title"])
                 long_url = upload_youtube_rotated(long_vid, long_plan["title"], long_plan["description"], long_plan["tags"], is_short=False)
-                published_summary.append(f"🖥️ <b>Largo:</b> <a href='{long_url}'>{long_plan['title']}</a>")
+                if not primary_long_url:
+                    primary_long_url = long_url
+                    primary_long_title = long_plan["title"]
+                sched_badge = f" <i>(Prog: {PUBLISH_HOUR_ART} ART)</i>" if PUBLISH_AT_ISO and PUBLISH_HOUR_ART != "NOW" else ""
+                published_summary.append(f"🖥️ <b>Largo #{idx}:</b> <a href='{long_url}'>{long_plan['title']}</a>{sched_badge}")
 
-            if MODE_CHOICE in ["1", "3"]:
-                await update_live_progress(65, f"Diseñando YouTube Short ({idx}/{len(subtopics)})...", topic)
-                short_plan = await generate_teaser_short_plan(topic, long_title, long_url)
-                short_vid = await render_video_with_real_clips(
-                    f"short_{idx}", short_plan["script"], short_plan["search_terms"],
-                    is_short=True, sfx_cues=short_plan.get("sfx_cues", [])
-                )
-                await update_live_progress(98, f"Subiendo Short ({idx}/{len(subtopics)}) a YouTube...", short_plan["title"])
+        # 2. PRODUCCIÓN DE SHORTS / REELS / TIKTOKS (9:16) SEGÚN SHORT_COUNT
+        for idx in range(1, SHORT_COUNT + 1):
+            topic = subtopics[(idx - 1) % len(subtopics)]
+            await update_live_progress(66, f"Diseñando Short / Reel / TikTok ({idx}/{SHORT_COUNT})...", topic)
+            short_plan = await generate_teaser_short_plan(topic, primary_long_title, primary_long_url)
+            short_vid = await render_video_with_real_clips(
+                f"short_{idx}", short_plan["script"], short_plan["search_terms"],
+                is_short=True, sfx_cues=short_plan.get("sfx_cues", [])
+            )
+            short_url = ""
+            if PLATFORMS.get("youtube", True):
+                await update_live_progress(97, f"Subiendo Short ({idx}/{SHORT_COUNT}) a YouTube...", short_plan["title"])
                 short_url = upload_youtube_rotated(short_vid, short_plan["title"], short_plan["description"], short_plan["tags"], is_short=True)
-                published_summary.append(f"📱 <b>Short:</b> <a href='{short_url}'>{short_plan['title']}</a>")
+                sched_badge = f" <i>(Prog: {PUBLISH_HOUR_ART} ART)</i>" if PUBLISH_AT_ISO and PUBLISH_HOUR_ART != "NOW" else ""
+                published_summary.append(f"📱 <b>Short #{idx}:</b> <a href='{short_url}'>{short_plan['title']}</a>{sched_badge}")
+
+            omni_notes = await distribute_omnichannel_short(short_plan, short_vid, short_url)
+            published_summary.extend(omni_notes)
 
         links_block = "\n".join(published_summary)
-        gum_line = f"\n💰 <b>Producto Digital / Gumroad:</b> {MONETIZATION_URL}" if MONETIZATION_URL else ""
-        await update_live_progress(100, "¡Producción y Publicación Completada! 🏁", f"Se publicaron {len(published_summary)} activos en {CHANNEL_NAME}.")
+        gum_line = f"\n\n💰 <b>Producto Digital / Gumroad:</b> {MONETIZATION_URL}" if MONETIZATION_URL else ""
+        await update_live_progress(100, "¡Producción Omnicanal Completada! 🏁", f"Activos generados para {CHANNEL_NAME}.")
         await send_telegram(
-            f"🏁 <b>¡Tanda Finalizada con Éxito en {CHANNEL_NAME}!</b>\n\n"
+            f"🏁 <b>¡Tanda Omnicanal Finalizada en {CHANNEL_NAME}!</b>\n"
+            f"🕒 <b>Programación:</b> {PUBLISH_HOUR_ART} ART\n\n"
             f"{links_block}{gum_line}"
         )
     except Exception as e:
