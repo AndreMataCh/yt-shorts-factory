@@ -2,6 +2,7 @@ import os
 import glob
 import json
 import logging
+import asyncio
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -11,10 +12,40 @@ from utils import retry_async
 
 logger = logging.getLogger("PAULA.Publishing")
 
+def asyncio_run_sync(coro):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            return pool.submit(asyncio.run, coro).result()
+    else:
+        return asyncio.run(coro)
+
 def upload_youtube_rotated(settings: Settings, video_path: str, title: str, description: str, tags: list[str], is_short: bool = True) -> str:
+    os.makedirs("tokens", exist_ok=True)
     token_path = f"tokens/{settings.channel_id}_token_kv.json"
+    
+    # Reconstruir o asegurar el archivo de token OAuth si no existe
+    if not os.path.exists(token_path) and settings.channel_token_json:
+        try:
+            parsed = json.loads(settings.channel_token_json)
+            full_token_data = {
+                "token": "",
+                "refresh_token": parsed.get("refresh_token", "") or parsed.get("refreshToken", ""),
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "client_id": parsed.get("client_id", os.getenv("GOOGLE_CLIENT_ID", "")),
+                "client_secret": parsed.get("client_secret", os.getenv("GOOGLE_CLIENT_SECRET", ""))
+            }
+            with open(token_path, "w", encoding="utf-8") as f:
+                json.dump(full_token_data, f)
+            logger.info(f"Token OAuth reconstruido correctamente en {token_path}")
+        except Exception as e:
+            logger.warning(f"No se pudo reconstruir el token desde BUNDLE: {e}")
+
     if not os.path.exists(token_path):
-        # Fallback a cualquier token disponible en la carpeta
         all_tokens = sorted(glob.glob("tokens/*.json"))
         if all_tokens:
             token_path = all_tokens[0]
@@ -55,16 +86,3 @@ def upload_youtube_rotated(settings: Settings, video_path: str, title: str, desc
     except Exception as e:
         logger.error(f"❌ Error crítico subiendo a YouTube: {e}")
         raise e
-
-def asyncio_run_sync(coro):
-    import asyncio
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    if loop and loop.is_running():
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            return pool.submit(asyncio.run, coro).result()
-    else:
-        return asyncio.run(coro)
