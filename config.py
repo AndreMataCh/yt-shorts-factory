@@ -2,8 +2,8 @@ import os
 import re
 import json
 import logging
-from dataclasses import dataclass, field
-from typing import Dict, Any, List
+from dataclasses import dataclass
+from typing import Dict, Any
 
 logger = logging.getLogger("PAULA.Config")
 
@@ -27,15 +27,17 @@ class Settings:
     openrouter_api_key: str
     pexels_api_key: str
     hf_token: str
+    google_client_id: str
+    google_client_secret: str
     omnichannel_webhook_url: str
     tiktok_access_token: str
     ig_access_token: str
     x_bearer_token: str
-    
+
     channel_id: str
     channel_name: str
     channel_token_json: str
-    
+
     raw_topic: str
     visual_style: str
     voice_style: str
@@ -43,18 +45,18 @@ class Settings:
     long_count: int
     short_count: int
     mode_choice: str
-    
+
     publish_at_iso: str
     publish_hour_art: str
     platforms: Dict[str, bool]
-    
+
     monetization_url: str
     custom_title: str
     custom_description: str
     source_video_url: str
     chat_id: str
     status_msg_id: str
-    
+
     gh_owner: str
     gh_repo: str
 
@@ -70,47 +72,51 @@ class Settings:
                 bundle = {}
 
         def get_val(env_key: str, bundle_key: str, default: str = "") -> str:
-            val = os.getenv(env_key) or bundle.get(bundle_key) or default
-            return str(val).strip()
+            env_v = (os.getenv(env_key) or "").strip()
+            if env_v:
+                return env_v
+            bun_v = bundle.get(bundle_key)
+            if bun_v is not None and str(bun_v).strip() != "":
+                return str(bun_v).strip()
+            return default
 
-        # Secretos sanitizados con clean_secret_token
         bot_token = clean_secret_token(get_val("TELEGRAM_BOT_TOKEN", "telegram_bot_token"))
         groq_api_key = clean_secret_token(get_val("GROQ_API_KEY", "groq_api_key"))
         gemini_api_key = clean_secret_token(get_val("GEMINI_API_KEY", "gemini_api_key"))
         openrouter_api_key = clean_secret_token(get_val("OPENROUTER_API_KEY", "openrouter_api_key"))
         pexels_api_key = clean_secret_token(get_val("PEXELS_API_KEY", "pexels_api_key"))
         hf_token = clean_secret_token(get_val("HF_TOKEN", "hf_token"))
-        
-        omnichannel_webhook_url = clean_secret_token(get_val("OMNICHANNEL_WEBHOOK_URL", "omnichannel_webhook_url"))
+        google_client_id = clean_secret_token(get_val("GOOGLE_CLIENT_ID", "google_client_id"))
+        google_client_secret = clean_secret_token(get_val("GOOGLE_CLIENT_SECRET", "google_client_secret"))
+
+        omnichannel_webhook_url = clean_text_field(get_val("OMNICHANNEL_WEBHOOK_URL", "omnichannel_webhook_url"))
         tiktok_access_token = clean_secret_token(get_val("TIKTOK_ACCESS_TOKEN", "tiktok_access_token"))
         ig_access_token = clean_secret_token(get_val("IG_ACCESS_TOKEN", "ig_access_token"))
         x_bearer_token = clean_secret_token(get_val("X_BEARER_TOKEN", "x_bearer_token"))
-        
+
         chat_id = clean_secret_token(get_val("CHAT_ID", "chat_id"))
         status_msg_id = clean_secret_token(get_val("STATUS_MSG_ID", "status_msg_id"))
 
-        # Textos y metadatos con clean_text_field (preservan acentos)
         channel_id = clean_text_field(get_val("CHANNEL_ID", "channel_id", "ch1")).lower()
         channel_name = clean_text_field(get_val("CHANNEL_NAME", "channel_name", channel_id.upper()))
         channel_token_json = get_val("CHANNEL_TOKEN_JSON", "channel_token_json", "")
-        
+
         raw_topic = clean_text_field(get_val("TOPIC", "topic", "Los secretos mejor guardados de la tecnología"))
         visual_style = clean_text_field(get_val("VISUAL_STYLE", "visual_style", "2"))
         voice_style = clean_text_field(get_val("VOICE_STYLE", "voice_style", "3"))
         mode_choice = clean_text_field(get_val("MODE", "mode", "3"))
-        
+
         monetization_url = clean_text_field(get_val("MONETIZATION_URL", "monetization_url", ""))
         custom_title = clean_text_field(get_val("CUSTOM_TITLE", "custom_title", ""))
         custom_description = clean_text_field(get_val("CUSTOM_DESCRIPTION", "custom_description", ""))
         source_video_url = clean_text_field(get_val("SOURCE_VIDEO_URL", "source_video_url", ""))
-        
+
         gh_owner = clean_text_field(get_val("GH_OWNER", "gh_owner", "AndreMataCh"))
         gh_repo = clean_text_field(get_val("GH_REPO", "gh_repo", "yt-shorts-factory"))
-        
+
         publish_at_iso = clean_text_field(get_val("PUBLISH_AT_ISO", "publish_at_iso", ""))
         publish_hour_art = clean_text_field(get_val("PUBLISH_HOUR_ART", "publish_hour_art", "NOW"))
 
-        # Validaciones numéricas estrictas con rangos seguros
         raw_count_str = get_val("VIDEO_COUNT", "video_count", "1")
         try:
             raw_count = max(1, min(int(re.sub(r"[^0-9]", "", raw_count_str) or "1"), 10))
@@ -151,6 +157,8 @@ class Settings:
             openrouter_api_key=openrouter_api_key,
             pexels_api_key=pexels_api_key,
             hf_token=hf_token,
+            google_client_id=google_client_id,
+            google_client_secret=google_client_secret,
             omnichannel_webhook_url=omnichannel_webhook_url,
             tiktok_access_token=tiktok_access_token,
             ig_access_token=ig_access_token,
