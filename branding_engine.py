@@ -4,6 +4,7 @@ import urllib.parse
 import asyncio
 import logging
 import httpx
+import re
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -35,8 +36,8 @@ async def generate_visual_asset(prompt: str, filename: str, w: int, h: int) -> s
         logger.error(f"Fallo al generar asset {filename}: {e}")
         return ""
 
-async def apply_branding_to_youtube(settings: Settings, logo_path: str) -> str:
-    """Sube el logotipo como marca de agua (watermark) al canal de YouTube."""
+async def apply_branding_and_bio_to_youtube(settings: Settings, logo_path: str, about_text: str) -> str:
+    """Sube el logotipo (Watermark) y actualiza la pestaña 'Acerca de' (Snippet Description)."""
     token_path = f"tokens/{settings.channel_id}_token_kv.json"
     
     if not os.path.exists(token_path):
@@ -44,10 +45,10 @@ async def apply_branding_to_youtube(settings: Settings, logo_path: str) -> str:
         if all_tokens:
             token_path = all_tokens[0]
         else:
-            return "⚠️ No se encontraron credenciales (token OAuth) para aplicar el branding."
+            return "⚠️ No se encontraron credenciales (token OAuth) para aplicar los cambios."
 
-    def _upload_watermark():
-        # Solicitamos permisos de force-ssl, requeridos para la API de Branding/Watermarks
+    def _execute_updates():
+        # Solicitamos permisos de force-ssl, requeridos para la API de Branding y edición de canales
         creds = Credentials.from_authorized_user_file(
             token_path, 
             ["https://www.googleapis.com/auth/youtube.force-ssl"]
@@ -56,39 +57,66 @@ async def apply_branding_to_youtube(settings: Settings, logo_path: str) -> str:
             creds.refresh(Request())
 
         youtube = build("youtube", "v3", credentials=creds)
+        results = []
         
-        # YouTube requiere que la imagen sea procesada como MediaFileUpload (MPEG/JPEG/PNG)
-        media = MediaFileUpload(logo_path, chunksize=-1, resumable=True, mimetype="image/jpeg")
-        
-        # Configurar para que la marca de agua aparezca 1 segundo después del inicio en todos los videos
-        request = youtube.watermarks().set(
-            channelId=settings.channel_id,
-            body={
-                "timing": {
-                    "type": "offsetFromStart",
-                    "offsetMs": 1000,
-                    "durationMs": 10000 
+        # 1. Aplicar Logotipo (Marca de Agua)
+        try:
+            media = MediaFileUpload(logo_path, chunksize=-1, resumable=True, mimetype="image/jpeg")
+            youtube.watermarks().set(
+                channelId=settings.channel_id,
+                body={
+                    "timing": {
+                        "type": "offsetFromStart",
+                        "offsetMs": 1000,
+                        "durationMs": 10000 
+                    },
+                    "position": {
+                        "type": "corner",
+                        "cornerPosition": "bottomRight"
+                    }
                 },
-                "position": {
-                    "type": "corner",
-                    "cornerPosition": "bottomRight"
-                }
-            },
-            media_body=media
-        )
-        request.execute()
-        return "✅ Logotipo aplicado automáticamente como Marca de Agua (Watermark) en los videos de YouTube."
+                media_body=media
+            ).execute()
+            results.append("✅ Logotipo aplicado como Marca de Agua en los videos.")
+        except Exception as e:
+            logger.error(f"Error al aplicar Watermark: {e}")
+            results.append("⚠️ Error al aplicar la marca de agua (posible falta de permisos).")
+
+        # 2. Aplicar Biografía SEO (Pestaña 'Acerca de')
+        if about_text:
+            try:
+                # Descargamos el snippet actual del canal para modificar SOLO la descripción sin pisar el título
+                ch_res = youtube.channels().list(mine=True, part="snippet").execute()
+                if ch_res.get("items"):
+                    ch_item = ch_res["items"][0]
+                    snippet = ch_item["snippet"]
+                    snippet["description"] = about_text[:990]  # Respetando límites de la API
+                    
+                    # Realizamos el PUT con el snippet modificado
+                    youtube.channels().update(
+                        part="snippet",
+                        body={
+                            "id": ch_item["id"],
+                            "snippet": snippet
+                        }
+                    ).execute()
+                    results.append("✅ Pestaña 'Acerca de' actualizada con la nueva biografía SEO.")
+            except Exception as e:
+                logger.error(f"Error al aplicar Biografía (Snippet): {e}")
+                results.append("⚠️ Error al actualizar la biografía (verifica permisos de lectura/escritura).")
+
+        return "\n".join(results)
 
     try:
-        # Envolvemos la llamada síncrona de googleapiclient en un hilo asíncrono seguro
         import concurrent.futures
         loop = asyncio.get_running_loop()
         with concurrent.futures.ThreadPoolExecutor() as pool:
-            result = await loop.run_in_executor(pool, _upload_watermark)
+            result = await loop.run_in_executor(pool, _execute_updates)
             return result
     except Exception as e:
-        logger.error(f"Fallo al aplicar branding en YouTube: {e}")
-        return "⚠️ Error al aplicar la marca de agua en YouTube. Revisa los permisos OAuth (youtube.force-ssl)."
+        logger.error(f"Fallo general en APIs de YouTube: {e}")
+        return "⚠️ Error crítico al conectar con YouTube APIs."
+
 
 async def build_channel_branding(settings: Settings) -> None:
     logger.info(f"Iniciando Motor de Branding para: {settings.channel_name} ({settings.raw_topic})")
@@ -105,7 +133,7 @@ async def build_channel_branding(settings: Settings) -> None:
         f"Crea la identidad visual y estrategia para un canal llamado '{settings.channel_name}' centrado en: '{settings.raw_topic}'.\n\n"
         f"Devuelve el resultado estrictamente en este formato:\n"
         f"PALETA: [3 Códigos HEX con su significado]\n"
-        f"YOUTUBE_ABOUT: [Bio SEO máximo 500 caracteres]\n"
+        f"YOUTUBE_ABOUT: [Bio SEO máximo 500 caracteres, con palabras clave para la pestaña Acerca de]\n"
         f"TIKTOK_BIO: [Bio punchy máximo 80 caracteres]\n"
         f"X_BIO: [Bio aguda máximo 160 caracteres]\n"
         f"GANCHOS: [3 fórmulas de ganchos virales]\n"
@@ -118,13 +146,26 @@ async def build_channel_branding(settings: Settings) -> None:
     # Valores de resguardo
     logo_prompt = f"modern minimalist logo for a {settings.raw_topic} channel, dark background, vector art"
     banner_prompt = f"cinematic abstract background representing {settings.raw_topic}, dark theme, 8k"
+    youtube_about = ""
     
+    # Extractor Robusto (Soporta múltiples líneas si el LLM incluye saltos de línea en la biografía)
+    parsing_about = False
     for line in raw_strategy.split('\n'):
-        line_stripped = line.strip()
+        line_stripped = line.strip().replace('**', '')
+        
         if line_stripped.startswith("LOGO_PROMPT:"):
             logo_prompt = line_stripped.replace("LOGO_PROMPT:", "").strip()
         elif line_stripped.startswith("BANNER_PROMPT:"):
             banner_prompt = line_stripped.replace("BANNER_PROMPT:", "").strip()
+        elif line_stripped.startswith("YOUTUBE_ABOUT:"):
+            youtube_about = line_stripped.replace("YOUTUBE_ABOUT:", "").strip()
+            parsing_about = True
+        elif parsing_about and line_stripped.startswith(("TIKTOK_BIO:", "X_BIO:", "GANCHOS:", "PALETA:", "LOGO_PROMPT:")):
+            parsing_about = False
+        elif parsing_about:
+            youtube_about += "\n" + line_stripped
+
+    youtube_about = youtube_about.strip()
 
     # 2. Generación Visual Concurrente
     os.makedirs("output/branding", exist_ok=True)
@@ -138,8 +179,8 @@ async def build_channel_branding(settings: Settings) -> None:
     )
 
     # 3. Aplicación Automática en YouTube
-    await send_telegram(settings, "⚙️ <i>Aplicando el nuevo logotipo en el canal de YouTube (Watermark)...</i>")
-    api_result = await apply_branding_to_youtube(settings, logo_path)
+    await send_telegram(settings, "⚙️ <i>Aplicando diseño de marca y metadatos SEO en el perfil de YouTube...</i>")
+    api_result = await apply_branding_and_bio_to_youtube(settings, logo_path, youtube_about)
 
     # 4. Notificación Final
     report = (
@@ -147,7 +188,7 @@ async def build_channel_branding(settings: Settings) -> None:
         f"{api_result}\n\n"
         f"<b>Estrategia y Copywriting:</b>\n"
         f"<pre>{raw_strategy[:2500]}</pre>\n\n"
-        f"<i>Nota: El Logo original y el Banner están guardados en Artifacts de GitHub Actions para descarga manual y subida al perfil principal.</i>"
+        f"<i>Nota: El Logo original y el Banner están listos para descarga en Artifacts de GitHub Actions.</i>"
     )
     
     await send_telegram(settings, report)
