@@ -15,7 +15,7 @@ except Exception:
 
 from config import Settings
 
-# Cargar configuración e inyectar HF_TOKEN antes de importar Kokoro
+# Cargar configuración e inyectar HF_TOKEN antes de importar Kokoro u otros modelos
 _boot_settings = Settings.from_env_or_bundle()
 if _boot_settings.hf_token:
     os.environ["HF_TOKEN"] = _boot_settings.hf_token
@@ -28,6 +28,12 @@ from media import render_video_with_real_clips, edit_uploaded_raw_video
 from publishing import upload_youtube_rotated, distribute_omnichannel_short
 from seo_curator import curate_niche_trends
 
+# IMPORTAR EL NUEVO MOTOR DE BRANDING
+try:
+    from branding_engine import build_channel_branding
+except ImportError:
+    build_channel_branding = None
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("PAULA.RunJob")
 
@@ -39,12 +45,33 @@ async def main() -> None:
     if settings.status_msg_id:
         persist_status_msg_id("output/.status_msg_id.json", settings.status_msg_id)
 
+    # ==========================================
+    # INTERCEPTOR: MODO BRANDING & SEO
+    # ==========================================
+    if settings.mode_choice in ["branding", "4"]:
+        logger.info(f"=== INICIANDO MOTOR DE BRANDING PARA: {settings.channel_name} ===")
+        if build_channel_branding:
+            try:
+                await build_channel_branding(settings)
+            except Exception as e:
+                logger.error(f"Error crítico en Branding Engine: {e}")
+                await send_telegram(settings, f"❌ <b>Error crítico en Motor de Branding:</b>\n<code>{escape_html(str(e)[:350])}</code>")
+                sys.exit(1)
+        else:
+            logger.error("branding_engine.py no se encontró en el repositorio.")
+            await send_telegram(settings, "❌ Error: El archivo <code>branding_engine.py</code> no existe en GitHub Actions.")
+        return  # Finaliza la ejecución aquí, no fabricar videos
+
+    # ==========================================
+    # MODO FÁBRICA DE VIDEOS OMNICANAL
+    # ==========================================
     logger.info(
         f"=== INICIANDO FÁBRICA ENTERPRISE PARA: {settings.channel_name} ({settings.channel_id}) | "
         f"{settings.long_count} Largos + {settings.short_count} Shorts ==="
     )
 
     try:
+        # Paso 1: Inteligencia Web con Crawl4AI
         await update_live_progress(
             settings,
             50,
@@ -56,9 +83,11 @@ async def main() -> None:
         except Exception as e:
             logger.warning(f"Curador web omitido: {e}")
 
+        # Paso 2: Motor de Voz
         logger.info("Inicializando motor neuronal Kokoro-82M...")
         kokoro_pipeline = KPipeline(lang_code='e')
 
+        # Alternativa: Video Pregrabado
         if settings.source_video_url:
             is_short_mode = (settings.short_count > 0 and settings.long_count == 0)
             edited_vid = await edit_uploaded_raw_video(settings.source_video_url, "raw_edit", is_short=is_short_mode)
@@ -69,6 +98,7 @@ async def main() -> None:
             await send_telegram(settings, f"✅ <b>Video Pregrabado Masterizado y Publicado:</b>\n🔗 {vid_url}")
             return
 
+        # Generación de Subtemas si hay múltiples videos
         max_needed = max(settings.long_count, settings.short_count, 1)
         if max_needed > 1:
             variation_prompt = (
@@ -86,7 +116,7 @@ async def main() -> None:
         primary_long_url = ""
         primary_long_title = settings.raw_topic
 
-        # 1. PRODUCCIÓN Y SUBIDA DE VIDEOS LARGOS (16:9)
+        # Paso 3: PRODUCCIÓN DE VIDEOS LARGOS (16:9)
         for idx in range(1, settings.long_count + 1):
             topic = subtopics[(idx - 1) % len(subtopics)]
             await update_live_progress(settings, 60, f"Diseñando Video Largo ({idx}/{settings.long_count})...", topic)
@@ -116,7 +146,7 @@ async def main() -> None:
                 sched_badge = f" <i>(Prog: {settings.publish_hour_art} ART)</i>" if settings.publish_at_iso and settings.publish_hour_art != "NOW" else ""
                 published_summary.append(f"🖥️ <b>Largo #{idx}:</b> <a href='{long_url}'>{escape_html(long_plan['title'])}</a>{sched_badge}")
 
-        # 2. PRODUCCIÓN Y SUBIDA DE SHORTS / REELS / TIKTOKS (9:16)
+        # Paso 4: PRODUCCIÓN DE SHORTS / REELS / TIKTOKS (9:16)
         for idx in range(1, settings.short_count + 1):
             topic = subtopics[(idx - 1) % len(subtopics)]
             await update_live_progress(settings, 66, f"Diseñando Short / Reel / TikTok ({idx}/{settings.short_count})...", topic)
@@ -147,6 +177,7 @@ async def main() -> None:
             omni_notes = await distribute_omnichannel_short(settings, short_plan, short_vid, short_url)
             published_summary.extend(omni_notes)
 
+        # Cierre
         links_block = "\n".join(published_summary) if published_summary else "<i>Sin activos marcados para subida.</i>"
         gum_line = f"\n\n💰 <b>Producto Digital / Gumroad:</b> {settings.monetization_url}" if settings.monetization_url else ""
         await update_live_progress(settings, 100, "¡Producción Omnicanal Completada! 🏁", f"Activos publicados en {settings.channel_name}.")
