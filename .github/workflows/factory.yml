@@ -68,3 +68,15 @@ jobs:
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python run_job.py
+      - name: Run PAULA Omnichannel Factory
+        env:
+          BUNDLE_JSON: ${{ github.event.client_payload.bundle_json }}
+        run: python run_job.py
+
+      - name: Guardar Artefactos (Branding y Videos)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PAULA-Outputs-${{ github.run_id }}
+          path: output/
+          retention-days: 7
