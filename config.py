@@ -1,187 +1,109 @@
 import os
-import re
 import json
 import logging
-from dataclasses import dataclass
-from typing import Dict, Any
 
 logger = logging.getLogger("PAULA.Config")
 
-def clean_secret_token(val: str) -> str:
-    """Sanitiza estrictamente tokens y API keys eliminando espacios, comillas y saltos de línea."""
-    if not val:
-        return ""
-    return re.sub(r'[\r\n\t"\'\s]+', '', str(val))
 
-def clean_text_field(val: str) -> str:
-    """Limpia textos descriptivos o títulos preservando acentos, eñes y espacios naturales."""
-    if not val:
-        return ""
-    return str(val).strip()
+def _parse_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "si", "sí")
 
-@dataclass
+
+def _parse_int(value, default: int) -> int:
+    try:
+        return int(float(str(value).strip()))
+    except Exception:
+        return default
+
+
 class Settings:
-    bot_token: str
-    groq_api_key: str
-    gemini_api_key: str
-    openrouter_api_key: str
-    pexels_api_key: str
-    hf_token: str
-    google_client_id: str
-    google_client_secret: str
-    omnichannel_webhook_url: str
-    tiktok_access_token: str
-    ig_access_token: str
-    x_bearer_token: str
+    """Configuración centralizada de PAULA v8.0 deserializada desde BUNDLE_JSON y entorno."""
 
-    channel_id: str
-    channel_name: str
-    channel_token_json: str
+    def __init__(self, bundle: dict | None = None):
+        data = bundle if isinstance(bundle, dict) else {}
 
-    raw_topic: str
-    visual_style: str
-    voice_style: str
-    raw_count: int
-    long_count: int
-    short_count: int
-    mode_choice: str
+        # Identificación de canal y ejecución
+        self.channel_id: str = str(data.get("channel_id") or os.getenv("CHANNEL_ID") or "ch1").strip()
+        self.channel_name: str = str(data.get("channel_name") or os.getenv("CHANNEL_NAME") or "Canal Omnicanal").strip()
+        self.raw_topic: str = str(data.get("topic") or os.getenv("TOPIC") or "Documental y análisis de alto impacto").strip()
+        self.custom_title: str = str(data.get("custom_title") or "").strip()
+        self.custom_description: str = str(data.get("custom_description") or "").strip()
+        self.mode_choice: str = str(data.get("mode") or os.getenv("MODE") or "3").strip()
+        self.chat_id: str = str(data.get("chat_id") or os.getenv("CHAT_ID") or "").strip()
+        self.status_msg_id: str = str(data.get("status_msg_id") or "").strip()
 
-    publish_at_iso: str
-    publish_hour_art: str
-    platforms: Dict[str, bool]
+        # Estilos multimedia y cuotas de tanda
+        self.visual_style: str = str(data.get("visual_style") or os.getenv("VISUAL_STYLE") or "2").strip()
+        self.voice_style: str = str(data.get("voice_style") or os.getenv("VOICE_STYLE") or "3").strip()
+        self.long_count: int = max(0, _parse_int(data.get("long_count", os.getenv("LONG_COUNT", 1)), 1))
+        self.short_count: int = max(0, _parse_int(data.get("short_count", os.getenv("SHORT_COUNT", 2)), 2))
+        self.video_count: int = max(
+            1,
+            _parse_int(data.get("video_count", os.getenv("VIDEO_COUNT", max(self.long_count, self.short_count, 1))), 1),
+        )
 
-    monetization_url: str
-    custom_title: str
-    custom_description: str
-    source_video_url: str
-    chat_id: str
-    status_msg_id: str
+        # Programación horaria (ART / ISO) y monetización
+        self.publish_hour_art: str = str(data.get("publish_hour_art") or os.getenv("PUBLISH_HOUR_ART") or "20:00").strip()
+        self.optimal_publish_hour_art: str = str(
+            data.get("optimal_publish_hour_art") or self.publish_hour_art or "20:00"
+        ).strip()
+        self.publish_at_iso: str = str(data.get("publish_at_iso") or os.getenv("PUBLISH_AT_ISO") or "").strip()
+        self.monetization_url: str = str(data.get("monetization_url") or "").strip()
 
-    gh_owner: str
-    gh_repo: str
+        # Activos personalizados: logo, intro y outro (videos largos 16:9)
+        self.custom_logo_url: str = str(data.get("custom_logo_url") or os.getenv("CUSTOM_LOGO_URL") or "").strip()
+        self.intro_url: str = str(data.get("intro_url") or os.getenv("INTRO_URL") or "").strip()
+        self.outro_url: str = str(data.get("outro_url") or os.getenv("OUTRO_URL") or "").strip()
+
+        # Credenciales OAuth y APIs
+        raw_token = data.get("channel_token_json", os.getenv("CHANNEL_TOKEN_JSON", ""))
+        self.channel_token_json: str = (
+            json.dumps(raw_token) if isinstance(raw_token, dict) else str(raw_token or "").strip()
+        )
+        self.google_client_id: str = str(
+            data.get("google_client_id") or os.getenv("GOOGLE_CLIENT_ID") or os.getenv("YOUTUBE_CLIENT_ID") or ""
+        ).strip()
+        self.google_client_secret: str = str(
+            data.get("google_client_secret") or os.getenv("GOOGLE_CLIENT_SECRET") or os.getenv("YOUTUBE_CLIENT_SECRET") or ""
+        ).strip()
+
+        self.gemini_api_key: str = str(data.get("gemini_api_key") or os.getenv("GEMINI_API_KEY") or "").strip()
+        self.groq_api_key: str = str(data.get("groq_api_key") or os.getenv("GROQ_API_KEY") or "").strip()
+        self.openrouter_api_key: str = str(data.get("openrouter_api_key") or os.getenv("OPENROUTER_API_KEY") or "").strip()
+        self.pexels_api_key: str = str(data.get("pexels_api_key") or os.getenv("PEXELS_API_KEY") or "").strip()
+        self.hf_token: str = str(data.get("hf_token") or os.getenv("HF_TOKEN") or "").strip()
+        self.bot_token: str = str(data.get("telegram_bot_token") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+        self.omnichannel_webhook_url: str = str(
+            data.get("omnichannel_webhook_url") or os.getenv("OMNICHANNEL_WEBHOOK_URL") or ""
+        ).strip()
+        self.tiktok_access_token: str = str(data.get("tiktok_access_token") or os.getenv("TIKTOK_ACCESS_TOKEN") or "").strip()
+        self.ig_access_token: str = str(data.get("ig_access_token") or os.getenv("IG_ACCESS_TOKEN") or "").strip()
+        self.x_bearer_token: str = str(data.get("x_bearer_token") or os.getenv("X_BEARER_TOKEN") or "").strip()
+
+        # Plataformas destino
+        plats = data.get("platforms")
+        if not isinstance(plats, dict):
+            plats = {}
+        self.platforms: dict[str, bool] = {
+            "youtube": _parse_bool(plats.get("youtube"), True),
+            "tiktok": _parse_bool(plats.get("tiktok"), True),
+            "reels": _parse_bool(plats.get("reels"), True),
+            "x": _parse_bool(plats.get("x"), True),
+        }
 
     @classmethod
     def from_env_or_bundle(cls) -> "Settings":
-        raw_bundle = (os.getenv("BUNDLE_JSON") or "").strip()
-        bundle: Dict[str, Any] = {}
-        if raw_bundle:
-            try:
-                bundle = json.loads(raw_bundle)
-            except Exception as e:
-                logger.warning(f"Aviso al parsear BUNDLE_JSON: {e}")
-                bundle = {}
-
-        def get_val(env_key: str, bundle_key: str, default: str = "") -> str:
-            env_v = (os.getenv(env_key) or "").strip()
-            if env_v:
-                return env_v
-            bun_v = bundle.get(bundle_key)
-            if bun_v is not None and str(bun_v).strip() != "":
-                return str(bun_v).strip()
-            return default
-
-        bot_token = clean_secret_token(get_val("TELEGRAM_BOT_TOKEN", "telegram_bot_token"))
-        groq_api_key = clean_secret_token(get_val("GROQ_API_KEY", "groq_api_key"))
-        gemini_api_key = clean_secret_token(get_val("GEMINI_API_KEY", "gemini_api_key"))
-        openrouter_api_key = clean_secret_token(get_val("OPENROUTER_API_KEY", "openrouter_api_key"))
-        pexels_api_key = clean_secret_token(get_val("PEXELS_API_KEY", "pexels_api_key"))
-        hf_token = clean_secret_token(get_val("HF_TOKEN", "hf_token"))
-        google_client_id = clean_secret_token(get_val("GOOGLE_CLIENT_ID", "google_client_id"))
-        google_client_secret = clean_secret_token(get_val("GOOGLE_CLIENT_SECRET", "google_client_secret"))
-
-        omnichannel_webhook_url = clean_text_field(get_val("OMNICHANNEL_WEBHOOK_URL", "omnichannel_webhook_url"))
-        tiktok_access_token = clean_secret_token(get_val("TIKTOK_ACCESS_TOKEN", "tiktok_access_token"))
-        ig_access_token = clean_secret_token(get_val("IG_ACCESS_TOKEN", "ig_access_token"))
-        x_bearer_token = clean_secret_token(get_val("X_BEARER_TOKEN", "x_bearer_token"))
-
-        chat_id = clean_secret_token(get_val("CHAT_ID", "chat_id"))
-        status_msg_id = clean_secret_token(get_val("STATUS_MSG_ID", "status_msg_id"))
-
-        channel_id = clean_text_field(get_val("CHANNEL_ID", "channel_id", "ch1")).lower()
-        channel_name = clean_text_field(get_val("CHANNEL_NAME", "channel_name", channel_id.upper()))
-        channel_token_json = get_val("CHANNEL_TOKEN_JSON", "channel_token_json", "")
-
-        raw_topic = clean_text_field(get_val("TOPIC", "topic", "Los secretos mejor guardados de la tecnología"))
-        visual_style = clean_text_field(get_val("VISUAL_STYLE", "visual_style", "2"))
-        voice_style = clean_text_field(get_val("VOICE_STYLE", "voice_style", "3"))
-        mode_choice = clean_text_field(get_val("MODE", "mode", "3"))
-
-        monetization_url = clean_text_field(get_val("MONETIZATION_URL", "monetization_url", ""))
-        custom_title = clean_text_field(get_val("CUSTOM_TITLE", "custom_title", ""))
-        custom_description = clean_text_field(get_val("CUSTOM_DESCRIPTION", "custom_description", ""))
-        source_video_url = clean_text_field(get_val("SOURCE_VIDEO_URL", "source_video_url", ""))
-
-        gh_owner = clean_text_field(get_val("GH_OWNER", "gh_owner", "AndreMataCh"))
-        gh_repo = clean_text_field(get_val("GH_REPO", "gh_repo", "yt-shorts-factory"))
-
-        publish_at_iso = clean_text_field(get_val("PUBLISH_AT_ISO", "publish_at_iso", ""))
-        publish_hour_art = clean_text_field(get_val("PUBLISH_HOUR_ART", "publish_hour_art", "NOW"))
-
-        raw_count_str = get_val("VIDEO_COUNT", "video_count", "1")
+        raw_bundle = os.getenv("BUNDLE_JSON", "").strip()
+        if not raw_bundle:
+            return cls({})
         try:
-            raw_count = max(1, min(int(re.sub(r"[^0-9]", "", raw_count_str) or "1"), 10))
-        except ValueError:
-            raw_count = 1
-
-        raw_long_str = get_val("LONG_COUNT", "long_count", "")
-        try:
-            if raw_long_str != "":
-                long_count = max(0, min(int(re.sub(r"[^0-9]", "", raw_long_str) or "0"), 5))
-            else:
-                long_count = raw_count if mode_choice in ["2", "3"] else 0
-        except ValueError:
-            long_count = 1
-
-        raw_short_str = get_val("SHORT_COUNT", "short_count", "")
-        try:
-            if raw_short_str != "":
-                short_count = max(0, min(int(re.sub(r"[^0-9]", "", raw_short_str) or "0"), 10))
-            else:
-                short_count = raw_count if mode_choice in ["1", "3"] else 0
-        except ValueError:
-            short_count = 1
-
-        if long_count == 0 and short_count == 0:
-            short_count = 1
-
-        platforms_raw = bundle.get("platforms")
-        if isinstance(platforms_raw, dict):
-            platforms = {str(k): bool(v) for k, v in platforms_raw.items()}
-        else:
-            platforms = {"youtube": True, "tiktok": True, "reels": True, "x": True}
-
-        return cls(
-            bot_token=bot_token,
-            groq_api_key=groq_api_key,
-            gemini_api_key=gemini_api_key,
-            openrouter_api_key=openrouter_api_key,
-            pexels_api_key=pexels_api_key,
-            hf_token=hf_token,
-            google_client_id=google_client_id,
-            google_client_secret=google_client_secret,
-            omnichannel_webhook_url=omnichannel_webhook_url,
-            tiktok_access_token=tiktok_access_token,
-            ig_access_token=ig_access_token,
-            x_bearer_token=x_bearer_token,
-            channel_id=channel_id,
-            channel_name=channel_name,
-            channel_token_json=channel_token_json,
-            raw_topic=raw_topic,
-            visual_style=visual_style,
-            voice_style=voice_style,
-            raw_count=raw_count,
-            long_count=long_count,
-            short_count=short_count,
-            mode_choice=mode_choice,
-            publish_at_iso=publish_at_iso,
-            publish_hour_art=publish_hour_art,
-            platforms=platforms,
-            monetization_url=monetization_url,
-            custom_title=custom_title,
-            custom_description=custom_description,
-            source_video_url=source_video_url,
-            chat_id=chat_id,
-            status_msg_id=status_msg_id,
-            gh_owner=gh_owner,
-            gh_repo=gh_repo
-        )
+            parsed = json.loads(raw_bundle)
+            if isinstance(parsed, dict):
+                return cls(parsed)
+        except Exception as exc:
+            logger.warning(f"No se pudo parsear BUNDLE_JSON ({exc}). Usando valores por defecto/entorno.")
+        return cls({})
