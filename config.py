@@ -54,10 +54,13 @@ class Settings:
         self.publish_at_iso: str = str(data.get("publish_at_iso") or os.getenv("PUBLISH_AT_ISO") or "").strip()
         self.monetization_url: str = str(data.get("monetization_url") or "").strip()
 
-        # Activos personalizados: logo, intro y outro (videos largos 16:9)
+        # Activos personalizados: logo, intro, outro y video fuente para edición
         self.custom_logo_url: str = str(data.get("custom_logo_url") or os.getenv("CUSTOM_LOGO_URL") or "").strip()
         self.intro_url: str = str(data.get("intro_url") or os.getenv("INTRO_URL") or "").strip()
         self.outro_url: str = str(data.get("outro_url") or os.getenv("OUTRO_URL") or "").strip()
+        self.source_video_url: str = str(
+            data.get("source_video_url") or data.get("video_url") or os.getenv("SOURCE_VIDEO_URL") or ""
+        ).strip()
 
         # Credenciales OAuth y APIs
         raw_token = data.get("channel_token_json", os.getenv("CHANNEL_TOKEN_JSON", ""))
