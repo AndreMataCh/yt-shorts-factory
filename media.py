@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import asyncio
 import logging
 import subprocess
@@ -9,7 +10,7 @@ import numpy as np
 import soundfile as sf
 from kokoro import KPipeline
 from config import Settings
-from utils import format_ass_time, sanitize_ass_word, BROWSER_HEADERS, update_live_progress
+from utils import format_ass_time, sanitize_ass_word, BROWSER_HEADERS, update_live_progress, retry_async
 
 try:
     from gradio_client import Client as GradioClient, handle_file
@@ -18,6 +19,13 @@ except ImportError:
     HAS_GRADIO = False
 
 logger = logging.getLogger("PAULA.Media")
+
+TARGET_FPS = 30
+LONG_W = 1920
+LONG_H = 1080
+SHORT_W = 1080
+SHORT_H = 1920
+
 
 def run_ffmpeg(cmd: list[str], step_desc: str = "FFmpeg", timeout_sec: int = 180) -> subprocess.CompletedProcess:
     try:
@@ -30,12 +38,278 @@ def run_ffmpeg(cmd: list[str], step_desc: str = "FFmpeg", timeout_sec: int = 180
         raise RuntimeError(f"Fallo en {step_desc} (Exit {res.returncode}): {tail_err[-250:]}")
     return res
 
+
 def get_audio_duration(audio_path: str) -> float:
     out = subprocess.check_output([
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1", audio_path
     ]).decode().strip()
     return float(out)
+
+
+def _has_audio_stream(media_path: str) -> bool:
+    """Verifica con ffprobe si el archivo contiene al menos un stream de audio."""
+    if not media_path or not os.path.exists(media_path):
+        return False
+    try:
+        res = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "stream=codec_type",
+                "-of", "default=noprint_wrappers=1:nokey=1", media_path,
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20,
+        )
+        return res.returncode == 0 and "audio" in (res.stdout or "").lower()
+    except Exception:
+        return False
+
+
+def _probe_duration_seconds(media_path: str, fallback: float = 5.0) -> float:
+    """Obtiene la duración en segundos con ffprobe o devuelve un respaldo seguro."""
+    if not media_path or not os.path.exists(media_path):
+        return fallback
+    try:
+        res = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", media_path,
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            val = float(res.stdout.strip())
+            if val > 0.2:
+                return val
+    except Exception:
+        pass
+    return fallback
+
+
+async def download_asset_file(url: str, dest_path: str, min_bytes: int = 512) -> str:
+    """Descarga un recurso remoto (intro_url, outro_url o clips) de forma segura."""
+    clean_url = str(url or "").strip()
+    if not clean_url or not clean_url.lower().startswith(("https://", "http://")):
+        return ""
+
+    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+    tmp_path = f"{dest_path}.part"
+
+    async def _fetch() -> str:
+        async with httpx.AsyncClient(timeout=90.0, follow_redirects=True, headers=BROWSER_HEADERS) as client:
+            async with client.stream("GET", clean_url) as resp:
+                resp.raise_for_status()
+                total = 0
+                with open(tmp_path, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        if chunk:
+                            f.write(chunk)
+                            total += len(chunk)
+                if total < min_bytes:
+                    raise RuntimeError(f"Archivo descargado incompleto ({total} bytes).")
+        os.replace(tmp_path, dest_path)
+        return dest_path
+
+    try:
+        return await retry_async(_fetch, retries=3, backoff=2.0)
+    except Exception as exc:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        logger.error(f"Error descargando {clean_url[:70]}: {exc}")
+        return ""
+
+
+def enhance_scene_clip(
+    input_path: str,
+    output_path: str,
+    width: int = LONG_W,
+    height: int = LONG_H,
+    is_static_image: bool = False,
+    duration_sec: float = 6.0,
+    motion_index: int = 0,
+) -> str:
+    """
+    Potencia calidad visual y retención de una escena (16:9 o 9:16):
+    - Escalado Lanczos, movimiento de cámara sutil (zoom/paneo) y nitidez controlada.
+    - Salida uniforme a 30 fps, yuv420p y audio 44.1 kHz estéreo normalizado (-14 LUFS).
+    """
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    safe_dur = max(1.5, float(duration_sec or 6.0))
+    total_frames = max(1, int(round(safe_dur * TARGET_FPS)))
+    has_audio = _has_audio_stream(input_path)
+
+    pan_modes = [
+        f"scale={width * 2}:{height * 2}:flags=lanczos,zoompan=z='min(zoom+0.0008,1.12)':x='(iw-iw/zoom)*0.5':y='(ih-ih/zoom)*0.45':d={total_frames}:s={width}x{height}:fps={TARGET_FPS}",
+        f"scale={width * 2}:{height * 2}:flags=lanczos,zoompan=z='1.10':x='(iw-iw/zoom)*(0.5+0.35*on/{total_frames})':y='(ih-ih/zoom)*0.5':d={total_frames}:s={width}x{height}:fps={TARGET_FPS}",
+        f"scale={width * 2}:{height * 2}:flags=lanczos,zoompan=z='max(1.12-0.0008*on,1.0)':x='(iw-iw/zoom)*0.5':y='(ih-ih/zoom)*(0.35+0.30*on/{total_frames})':d={total_frames}:s={width}x{height}:fps={TARGET_FPS}",
+    ]
+    sharpen_tail = ",eq=contrast=1.04:brightness=0.01:saturation=1.06,unsharp=5:5:0.45:5:5:0.0,format=yuv420p"
+
+    cmd = ["ffmpeg", "-y"]
+    if is_static_image:
+        cmd.extend(["-loop", "1", "-t", f"{safe_dur:.2f}", "-i", input_path])
+        vf_chain = pan_modes[motion_index % len(pan_modes)] + sharpen_tail
+    else:
+        cmd.extend(["-t", f"{safe_dur:.2f}", "-i", input_path])
+        vf_chain = (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos,"
+            f"crop={width}:{height},fps={TARGET_FPS}" + sharpen_tail
+        )
+
+    if has_audio:
+        cmd.extend([
+            "-i", input_path,
+            "-filter_complex",
+            f"[0:v]{vf_chain}[vout];[1:a]aformat=sample_fmts=fltp:channel_layouts=stereo:sample_rates=44100,"
+            f"loudnorm=I=-14:TP=-1.5:LRA=11,aresample=44100[aout]",
+            "-map", "[vout]", "-map", "[aout]",
+        ])
+    else:
+        cmd.extend([
+            "-f", "lavfi", "-t", f"{safe_dur:.2f}", "-i", "anullsrc=r=44100:cl=stereo",
+            "-filter_complex", f"[0:v]{vf_chain}[vout];[1:a]aformat=sample_fmts=fltp:channel_layouts=stereo:sample_rates=44100[aout]",
+            "-map", "[vout]", "-map", "[aout]",
+        ])
+
+    cmd.extend([
+        "-c:v", "libx264", "-profile:v", "high", "-level", "4.1",
+        "-preset", "medium", "-crf", "18",
+        "-c:a", "aac", "-b:a", "192k",
+        "-shortest", "-movflags", "+faststart",
+        output_path,
+    ])
+    run_ffmpeg(cmd, "Mejora visual de escena", timeout_sec=240)
+    return output_path
+
+
+def normalize_long_segment_1080p(input_path: str, output_path: str) -> str:
+    """Normaliza intro, cuerpo principal o outro a 1920x1080 @ 30fps + audio AAC 44.1kHz -14 LUFS."""
+    if not input_path or not os.path.exists(input_path):
+        raise FileNotFoundError(f"Segmento inexistente: {input_path}")
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    duration_sec = _probe_duration_seconds(input_path, fallback=10.0)
+    has_audio = _has_audio_stream(input_path)
+
+    vf_norm = (
+        f"scale={LONG_W}:{LONG_H}:force_original_aspect_ratio=decrease:flags=lanczos,"
+        f"pad={LONG_W}:{LONG_H}:(ow-iw)/2:(oh-ih)/2:black,"
+        f"fps={TARGET_FPS},eq=contrast=1.03:saturation=1.05,"
+        f"unsharp=5:5:0.4:5:5:0.0,format=yuv420p"
+    )
+    af_norm = "aformat=sample_fmts=fltp:channel_layouts=stereo:sample_rates=44100,loudnorm=I=-14:TP=-1.5:LRA=11,aresample=44100"
+
+    cmd = ["ffmpeg", "-y", "-i", input_path]
+    if has_audio:
+        cmd.extend(["-vf", vf_norm, "-af", af_norm, "-map", "0:v:0", "-map", "0:a:0"])
+    else:
+        cmd.extend([
+            "-f", "lavfi", "-t", f"{duration_sec:.2f}", "-i", "anullsrc=r=44100:cl=stereo",
+            "-filter_complex", f"[0:v]{vf_norm}[vout];[1:a]aformat=sample_fmts=fltp:channel_layouts=stereo:sample_rates=44100[aout]",
+            "-map", "[vout]", "-map", "[aout]",
+        ])
+
+    cmd.extend([
+        "-c:v", "libx264", "-profile:v", "high", "-level", "4.1",
+        "-preset", "medium", "-crf", "18",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        output_path,
+    ])
+    run_ffmpeg(cmd, "Normalización segmento 1080p", timeout_sec=360)
+    return output_path
+
+
+def assemble_long_video_with_intro_outro(
+    main_video_path: str,
+    final_output_path: str,
+    intro_path: str = "",
+    outro_path: str = "",
+    work_dir: str = "output/render_tmp",
+) -> str:
+    """Une intro + video largo principal + outro con timestamps reiniciados (sin exit status 234)."""
+    if not main_video_path or not os.path.exists(main_video_path):
+        raise FileNotFoundError(f"Video principal no encontrado: {main_video_path}")
+
+    os.makedirs(work_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(final_output_path) or ".", exist_ok=True)
+
+    segments_norm: list[str] = []
+    try:
+        if intro_path and os.path.exists(intro_path) and os.path.getsize(intro_path) > 512:
+            segments_norm.append(
+                normalize_long_segment_1080p(intro_path, os.path.join(work_dir, "01_intro_1080p.mp4"))
+            )
+
+        segments_norm.append(
+            normalize_long_segment_1080p(main_video_path, os.path.join(work_dir, "02_main_1080p.mp4"))
+        )
+
+        if outro_path and os.path.exists(outro_path) and os.path.getsize(outro_path) > 512:
+            segments_norm.append(
+                normalize_long_segment_1080p(outro_path, os.path.join(work_dir, "03_outro_1080p.mp4"))
+            )
+
+        if len(segments_norm) == 1:
+            shutil.copyfile(segments_norm[0], final_output_path)
+            return final_output_path
+
+        inputs: list[str] = []
+        filter_nodes: list[str] = []
+        concat_streams = ""
+        for idx, seg in enumerate(segments_norm):
+            inputs.extend(["-i", seg])
+            filter_nodes.append(f"[{idx}:v]setpts=PTS-STARTPTS[v{idx}];[{idx}:a]asetpts=PTS-STARTPTS[a{idx}]")
+            concat_streams += f"[v{idx}][a{idx}]"
+
+        filter_complex = ";".join(filter_nodes) + f";{concat_streams}concat=n={len(segments_norm)}:v=1:a=1[outv][outa]"
+
+        cmd = [
+            "ffmpeg", "-y", *inputs,
+            "-filter_complex", filter_complex,
+            "-map", "[outv]", "-map", "[outa]",
+            "-c:v", "libx264", "-profile:v", "high", "-level", "4.1",
+            "-preset", "medium", "-crf", "18",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            final_output_path,
+        ]
+        run_ffmpeg(cmd, "Concatenación Intro/Cuerpo/Outro", timeout_sec=420)
+        return final_output_path
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+async def prepare_long_video_with_branding(
+    settings: Settings,
+    main_video_path: str,
+    final_output_path: str,
+) -> str:
+    """Descarga settings.intro_url y settings.outro_url y ensambla el video largo 1080p final."""
+    tmp_dir = f"output/assets_{settings.channel_id}"
+    intro_local = ""
+    outro_local = ""
+
+    try:
+        if getattr(settings, "intro_url", ""):
+            intro_local = await download_asset_file(settings.intro_url, os.path.join(tmp_dir, "intro_raw.mp4"))
+        if getattr(settings, "outro_url", ""):
+            outro_local = await download_asset_file(settings.outro_url, os.path.join(tmp_dir, "outro_raw.mp4"))
+
+        return await asyncio.to_thread(
+            assemble_long_video_with_intro_outro,
+            main_video_path,
+            final_output_path,
+            intro_local,
+            outro_local,
+            os.path.join(tmp_dir, "ffmpeg_work"),
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
 
 def _sync_f5_infer(space_id: str, ref_audio: str, script_text: str, hf_token: str) -> str:
     client = GradioClient(space_id, hf_token=hf_token if hf_token else None)
@@ -48,6 +322,7 @@ def _sync_f5_infer(space_id: str, ref_audio: str, script_text: str, hf_token: st
     )
     out_file = res[0] if isinstance(res, (list, tuple)) else res
     return str(out_file) if out_file else ""
+
 
 async def generate_voice_hybrid(settings: Settings, script_text: str, audio_path: str, kokoro_pipeline: KPipeline, is_short: bool = True) -> None:
     raw_voice = f"{audio_path}_raw.wav"
@@ -101,6 +376,7 @@ async def generate_voice_hybrid(settings: Settings, script_text: str, audio_path
         "-c:a", "pcm_s16le", "-ar", "24000", "-ac", "1", audio_path
     ], "Limpieza y masterización de voz")
 
+
 def ensure_sfx_bank() -> dict[str, str]:
     os.makedirs("output/sfx", exist_ok=True)
     bank = {
@@ -136,6 +412,7 @@ def ensure_sfx_bank() -> dict[str, str]:
         ], "SFX Glitch")
     return bank
 
+
 def resolve_sfx_timestamps(sfx_cues: list[dict], words_timed: list[dict], total_duration: float) -> list[dict]:
     resolved = []
     if not words_timed:
@@ -146,6 +423,7 @@ def resolve_sfx_timestamps(sfx_cues: list[dict], words_timed: list[dict], total_
         if t_sec < total_duration - 0.2:
             resolved.append({"type": cue["type"], "time": t_sec})
     return resolved[:10]
+
 
 async def prepare_background_music(duration: float, bgm_path: str) -> None:
     bgm_urls = [
@@ -173,6 +451,7 @@ async def prepare_background_music(duration: float, bgm_path: str) -> None:
         "-i", f"aevalsrc='0.12*sin(2*PI*130.81*t)+0.08*sin(2*PI*196*t)':s=24000:d={duration:.2f}",
         "-af", "lowpass=f=600", "-c:a", "pcm_s16le", "-ar", "24000", "-ac", "1", bgm_path
     ], "BGM Sintético")
+
 
 def mix_master_audio_with_sfx(voice_path: str, bgm_path: str, resolved_sfx: list[dict], sfx_bank: dict[str, str], total_duration: float, mixed_audio: str) -> None:
     fade_start = max(0.0, total_duration - 2.0)
@@ -202,6 +481,7 @@ def mix_master_audio_with_sfx(voice_path: str, bgm_path: str, resolved_sfx: list
         "-filter_complex", ";".join(filter_parts),
         "-map", "[aout]", "-c:a", "pcm_s16le", "-ar", "24000", "-ac", "1", mixed_audio
     ], "Mezcla Multicapa SFX + Voz + BGM")
+
 
 async def get_word_timestamps(settings: Settings, audio_path: str, script_text: str, total_duration: float) -> list[dict]:
     if settings.groq_api_key and settings.groq_api_key.startswith("gsk_"):
@@ -266,6 +546,7 @@ async def get_word_timestamps(settings: Settings, audio_path: str, script_text: 
         current_t += dur
     return fallback_aligned
 
+
 def get_channel_subtitle_profile(channel_name: str, topic: str) -> dict:
     text_sig = (channel_name + " " + topic).lower()
     if any(k in text_sig for k in ["terror", "misteri", "oscuro", "crimen", "miedo", "secreto", "interrogatorio"]):
@@ -279,6 +560,7 @@ def get_channel_subtitle_profile(channel_name: str, topic: str) -> dict:
         "primary_tag": "&HFFFFFF&", "active_tag": "&H00FFFF&", "font_name": "DejaVu Sans",
         "font_size_short": 82, "font_size_long": 58
     }
+
 
 def build_viral_ass_subtitles(words_timed: list[dict], ass_path: str, w: int, h: int, is_short: bool, total_duration: float, channel_name: str = "", topic: str = "") -> None:
     profile = get_channel_subtitle_profile(channel_name, topic)
@@ -333,6 +615,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     with open(ass_path, "w", encoding="utf-8") as f:
         f.writelines(lines)
 
+
 async def prepare_channel_avatar(settings: Settings, prefix: str) -> str:
     os.makedirs("assets/avatars", exist_ok=True)
     avatar_candidates = [
@@ -364,23 +647,30 @@ async def prepare_channel_avatar(settings: Settings, prefix: str) -> str:
     ], "Render Avatar PiP Local")
     return avatar_vid
 
+
 def postproducir_video_maestro(input_video: str, output_video: str, is_short: bool = True, trim_silences: bool = True) -> str:
-    w, h = (1080, 1920) if is_short else (1920, 1080)
+    w, h = (SHORT_W, SHORT_H) if is_short else (LONG_W, LONG_H)
     filtro_audio = (
-        "silenceremove=stop_periods=-1:stop_duration=0.35:stop_threshold=-48dB,loudnorm=I=-16:TP=-1.5:LRA=11,acompressor"
-        if trim_silences else "loudnorm=I=-16:TP=-1.5:LRA=11"
+        "silenceremove=stop_periods=-1:stop_duration=0.35:stop_threshold=-48dB,loudnorm=I=-14:TP=-1.5:LRA=11,acompressor"
+        if trim_silences else "loudnorm=I=-14:TP=-1.5:LRA=11"
     )
-    filtro_video = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps=30"
+    filtro_video = (
+        f"scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,"
+        f"crop={w}:{h},fps={TARGET_FPS},eq=contrast=1.03:saturation=1.05,unsharp=5:5:0.4:5:5:0.0,format=yuv420p"
+    )
 
     run_ffmpeg([
         "ffmpeg", "-y", "-i", input_video,
         "-af", filtro_audio,
         "-vf", filtro_video,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "19", "-threads", "4",
-        "-c:a", "aac", "-b:a", "192k",
+        "-c:v", "libx264", "-profile:v", "high", "-level", "4.1",
+        "-preset", "medium", "-crf", "18", "-threads", "4",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+        "-movflags", "+faststart",
         output_video
     ], "Masterización Final")
     return output_video
+
 
 async def edit_uploaded_raw_video(video_url: str, prefix: str, is_short: bool = True) -> str:
     os.makedirs("output", exist_ok=True)
@@ -392,6 +682,7 @@ async def edit_uploaded_raw_video(video_url: str, prefix: str, is_short: bool = 
         with open(raw_input, "wb") as f:
             f.write(res.content)
     return postproducir_video_maestro(raw_input, final_video, is_short=is_short, trim_silences=True)
+
 
 async def build_single_scene_clip(
     settings: Settings,
@@ -406,7 +697,7 @@ async def build_single_scene_clip(
     sem: asyncio.Semaphore
 ) -> str:
     clip_file = f"output/{prefix}_clip_{i}.mp4"
-    vfx_flash = "fade=t=in:st=0:d=0.12,eq=contrast=1.08:saturation=1.15"
+    vfx_flash = "fade=t=in:st=0:d=0.12,eq=contrast=1.08:saturation=1.15,unsharp=5:5:0.4:5:5:0.0"
 
     async with sem:
         got_clip = False
@@ -430,7 +721,7 @@ async def build_single_scene_clip(
                                 run_ffmpeg,
                                 [
                                     "ffmpeg", "-y", "-stream_loop", "-1", "-t", f"{clip_duration:.2f}", "-i", raw_vid,
-                                    "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,{vfx_flash},fps=30",
+                                    "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h},setsar=1,{vfx_flash},fps=30",
                                     "-r", "30", "-vsync", "cfr", "-video_track_timescale", "15360",
                                     "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-threads", "2", clip_file
                                 ],
@@ -456,7 +747,7 @@ async def build_single_scene_clip(
                             run_ffmpeg,
                             [
                                 "ffmpeg", "-y", "-loop", "1", "-t", f"{clip_duration:.2f}", "-i", scene_img,
-                                "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},zoompan=z='{z_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames_per_clip}:s={w}x{h}:fps=30,setsar=1,{vfx_flash}",
+                                "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h},zoompan=z='{z_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames_per_clip}:s={w}x{h}:fps=30,setsar=1,{vfx_flash}",
                                 "-r", "30", "-vsync", "cfr", "-video_track_timescale", "15360",
                                 "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-threads", "2", clip_file
                             ],
@@ -479,7 +770,25 @@ async def build_single_scene_clip(
                 45
             )
 
+    enhanced_clip = f"output/{prefix}_clip_{i}_enh.mp4"
+    try:
+        await asyncio.to_thread(
+            enhance_scene_clip,
+            clip_file,
+            enhanced_clip,
+            w,
+            h,
+            False,
+            clip_duration,
+            i,
+        )
+        if os.path.exists(enhanced_clip) and os.path.getsize(enhanced_clip) > 512:
+            return os.path.abspath(enhanced_clip).replace("\\", "/")
+    except Exception as e:
+        logger.warning(f"[Scene {i}] Fallback a clip base sin enhance_scene_clip: {e}")
+
     return os.path.abspath(clip_file).replace("\\", "/")
+
 
 async def render_video_with_real_clips(
     settings: Settings,
@@ -491,7 +800,7 @@ async def render_video_with_real_clips(
     sfx_cues: list[dict] = None
 ) -> str:
     os.makedirs("output", exist_ok=True)
-    w, h = (1080, 1920) if is_short else (1920, 1080)
+    w, h = (SHORT_W, SHORT_H) if is_short else (LONG_W, LONG_H)
     orientation = "portrait" if is_short else "landscape"
     format_label = "Short/Reels/TikTok 9:16" if is_short else "Documental 16:9"
 
@@ -500,6 +809,7 @@ async def render_video_with_real_clips(
     mixed_audio = f"output/{prefix}_master.wav"
     ass_path = f"output/{prefix}_subs.ass"
     raw_output = f"output/{prefix}_raw.mp4"
+    master_video = f"output/{prefix}_master.mp4"
     final_video = f"output/{prefix}_final.mp4"
 
     await update_live_progress(settings, 68, f"Generando voz neuronal y alineando fonemas ({format_label})...", "Kokoro-82M / F5-TTS + Whisper Alignment")
@@ -518,7 +828,7 @@ async def render_video_with_real_clips(
     target_cut_sec = 3.2 if is_short else 4.5
     num_cuts = min(16, max(int(np.ceil(total_duration / target_cut_sec)), len(search_terms), 4))
     clip_duration = total_duration / num_cuts
-    frames_per_clip = max(30, int(round(clip_duration * 30)))
+    frames_per_clip = max(30, int(round(clip_duration * TARGET_FPS)))
 
     await update_live_progress(settings, 84, f"Renderizando {num_cuts} escenas en paralelo ({format_label})...", "Motor Concurrente + FFmpeg Multithread")
 
@@ -559,16 +869,22 @@ async def render_video_with_real_clips(
             "-filter_complex",
             f"[0:v][2:v]overlay=x=40:y={pip_y}:enable='between(t,0,4.5)'[vpip];[vpip]ass={ass_filter_path}[vout]",
             "-map", "[vout]", "-map", "1:a",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "20", "-threads", "4",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "18", "-threads", "4",
             "-c:a", "aac", "-b:a", "192k", "-shortest", raw_output
         ], "Render con Avatar PiP", 240)
     else:
         run_ffmpeg([
             "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
             "-i", mixed_audio, "-vf", f"ass={ass_filter_path}",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "20", "-threads", "4",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "18", "-threads", "4",
             "-c:a", "aac", "-b:a", "192k", "-shortest", raw_output
         ], "Render Estándar", 240)
 
-    postproducir_video_maestro(raw_output, final_video, is_short=is_short, trim_silences=False)
+    postproducir_video_maestro(raw_output, master_video, is_short=is_short, trim_silences=False)
+
+    if not is_short and (getattr(settings, "intro_url", "") or getattr(settings, "outro_url", "")):
+        await update_live_progress(settings, 96, "Ensamblando Intro y Outro en Video Largo 16:9...", "Normalización 1080p 30fps + loudnorm")
+        return await prepare_long_video_with_branding(settings, master_video, final_video)
+
+    shutil.copyfile(master_video, final_video)
     return final_video
